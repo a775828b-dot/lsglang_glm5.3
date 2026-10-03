@@ -1,0 +1,150 @@
+{
+ "date": "2026-10-03",
+ "ppl": {
+  "method": "bench/ppl_eval.py --tokens 4096 --segments 6 (13 segments: docs, agent sessions, Chinese doc)",
+  "runs": {
+   "final-v17-1": {
+    "docs": {
+     "segments": 6,
+     "nll": 1.50004,
+     "ppl": 4.4819
+    },
+    "agent": {
+     "segments": 6,
+     "nll": 1.18186,
+     "ppl": 3.2604
+    },
+    "zh": {
+     "segments": 1,
+     "nll": 2.17378,
+     "ppl": 8.7915
+    },
+    "all": {
+     "segments": 13,
+     "nll": 1.40502,
+     "ppl": 4.0756
+    }
+   },
+   "final-v17-2": {
+    "docs": {
+     "segments": 6,
+     "nll": 1.49913,
+     "ppl": 4.4778
+    },
+    "agent": {
+     "segments": 6,
+     "nll": 1.18024,
+     "ppl": 3.2551
+    },
+    "zh": {
+     "segments": 1,
+     "nll": 2.16851,
+     "ppl": 8.7453
+    },
+    "all": {
+     "segments": 13,
+     "nll": 1.40344,
+     "ppl": 4.0692
+    }
+   },
+   "final-v17-3": {
+    "docs": {
+     "segments": 6,
+     "nll": 1.49889,
+     "ppl": 4.4767
+    },
+    "agent": {
+     "segments": 6,
+     "nll": 1.18194,
+     "ppl": 3.2607
+    },
+    "zh": {
+     "segments": 1,
+     "nll": 2.17126,
+     "ppl": 8.7693
+    },
+    "all": {
+     "segments": 13,
+     "nll": 1.40433,
+     "ppl": 4.0728
+    }
+   },
+   "final-v17-4": {
+    "docs": {
+     "segments": 6,
+     "nll": 1.49804,
+     "ppl": 4.4729
+    },
+    "agent": {
+     "segments": 6,
+     "nll": 1.18214,
+     "ppl": 3.2614
+    },
+    "zh": {
+     "segments": 1,
+     "nll": 2.17648,
+     "ppl": 8.8153
+    },
+    "all": {
+     "segments": 13,
+     "nll": 1.40443,
+     "ppl": 4.0732
+    }
+   },
+   "final-closedlk-1": {
+    "docs": {
+     "segments": 6,
+     "nll": 1.48601,
+     "ppl": 4.4194
+    },
+    "agent": {
+     "segments": 6,
+     "nll": 1.18516,
+     "ppl": 3.2712
+    },
+    "zh": {
+     "segments": 1,
+     "nll": 2.16819,
+     "ppl": 8.7424
+    },
+    "all": {
+     "segments": 13,
+     "nll": 1.39963,
+     "ppl": 4.0537
+    }
+   },
+   "final-closedlk-2": {
+    "docs": {
+     "segments": 6,
+     "nll": 1.48514,
+     "ppl": 4.4156
+    },
+    "agent": {
+     "segments": 6,
+     "nll": 1.18416,
+     "ppl": 3.2679
+    },
+    "zh": {
+     "segments": 1,
+     "nll": 2.16663,
+     "ppl": 8.7289
+    },
+    "all": {
+     "segments": 13,
+     "nll": 1.39865,
+     "ppl": 4.0497
+    }
+   }
+  }
+ },
+ "multi_turn_decode": {
+  "method": "bench/spec_bench.py PORT TAG 2 (6 prompts x 2 rounds, max 700 tokens, temp 0)",
+  "lkqmoe_tok_s": [
+   61.7,
+   61.3
+  ],
+  "closed_lk_moe_tok_s": [
+   38.77
+  ]
+ }
+}

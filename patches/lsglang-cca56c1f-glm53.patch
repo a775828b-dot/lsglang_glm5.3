@@ -1,0 +1,2535 @@
+diff --git a/python/sglang/kernels/ops/layernorm/mhc.py b/python/sglang/kernels/ops/layernorm/mhc.py
+index b4a00c4419..7e82bf281e 100644
+--- a/python/sglang/kernels/ops/layernorm/mhc.py
++++ b/python/sglang/kernels/ops/layernorm/mhc.py
+@@ -5,6 +5,7 @@ import math
+ import threading
+ from typing import Tuple
+ 
++import os
+ import torch
+ 
+ from sglang.kernels.jit.utils import is_arch_support_pdl
+@@ -835,7 +836,17 @@ def mhc_pre(
+             num_tokens, hidden_size, dtype=torch.bfloat16, device=residual.device
+         )
+ 
+-    if envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get():
++    use_deep_gemm_prenorm = envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get()
++    if use_deep_gemm_prenorm:
++        # DeepGEMM needs tcgen05/TMEM (SM100+ datacenter), which SM120 lacks;
++        # the wrapper would otherwise raise NameError on the undefined module.
++        from sglang.srt.layers.deep_gemm_wrapper.configurer import (
++            ENABLE_JIT_DEEPGEMM,
++        )
++
++        use_deep_gemm_prenorm = use_deep_gemm_prenorm and ENABLE_JIT_DEEPGEMM
++
++    if use_deep_gemm_prenorm:
+         n_splits = _compute_num_split_for_mhc_pre(num_tokens, hc_hidden_size)
+ 
+         gemm_out_mul = torch.empty(
+@@ -1448,15 +1459,40 @@ def mhc_fused_post_pre(
+         )
+ 
+         if envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get():
+-            import deep_gemm
+-
+-            deep_gemm.tf32_hc_prenorm_gemm(
+-                residual_cur.view(num_tokens, hc_hidden_size),
+-                fn,
+-                gemm_out_mul,
+-                gemm_out_sqrsum,
+-                num_splits=n_splits,
++            from sglang.srt.layers.deep_gemm_wrapper.configurer import (
++                ENABLE_JIT_DEEPGEMM,
+             )
++
++            if ENABLE_JIT_DEEPGEMM:
++                import deep_gemm
++
++                deep_gemm.tf32_hc_prenorm_gemm(
++                    residual_cur.view(num_tokens, hc_hidden_size),
++                    fn,
++                    gemm_out_mul,
++                    gemm_out_sqrsum,
++                    num_splits=n_splits,
++                )
++            else:
++                # DeepGEMM is unavailable (e.g. SM120 lacks tcgen05/TMEM): mirror
++                # the TileLang pre-norm fallback below.
++                n_splits = 1
++                gemm_out_mul_2d = torch.empty(
++                    num_tokens, hc_mult3, dtype=torch.float32, device=residual.device
++                )
++                gemm_out_sqrsum_1d = torch.empty(
++                    num_tokens, dtype=torch.float32, device=residual.device
++                )
++                mhc_pre_gemm_sqrsum_tilelang(
++                    residual_cur.view(num_tokens, hc_hidden_size),
++                    fn,
++                    gemm_out_mul_2d,
++                    gemm_out_sqrsum_1d,
++                    hc_mult3,
++                    hc_hidden_size,
++                )
++                gemm_out_mul = gemm_out_mul_2d.unsqueeze(0)
++                gemm_out_sqrsum = gemm_out_sqrsum_1d.unsqueeze(0)
+         else:
+             # Fallback mirrors mhc_pre when DeepGEMM prenorm is disabled.
+             n_splits = 1
+@@ -1660,6 +1696,14 @@ def _mhc_pre_dispatch(
+     """
+     assert residual.dim() == 3, f"residual must be (s, n, h); got {residual.shape}"
+     if not envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
++        if os.environ.get("SGLANG_MHC_PRE_TRITON", "0") == "1":
++            from sglang.kernels.ops.layernorm.mhc_sm120_triton import mhc_pre_triton
++
++            post_mix, comb_mix, layer_input = mhc_pre_triton(
++                residual, fn, hc_scale, hc_base, rms_eps, hc_pre_eps,
++                hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat,
++            )
++            return post_mix, comb_mix, layer_input, False
+         post_mix, comb_mix, layer_input = _mhc_pre_torch(
+             residual=residual,
+             fn=fn,
+@@ -1699,6 +1743,12 @@ def _mhc_post_dispatch(
+     assert x.dim() == 2 and residual.dim() == 3
+     assert post_layer_mix.dim() == 3 and comb_res_mix.dim() == 3
+     if not envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get():
++        if os.environ.get("SGLANG_MHC_POST_TRITON", "0") == "1":
++            from sglang.kernels.ops.layernorm.mhc_sm120_triton import mhc_post_triton
++
++            return mhc_post_triton(
++                x, residual, post_layer_mix, comb_res_mix, residual.shape[1]
++            )
+         return _mhc_post_torch(x, residual, post_layer_mix, comb_res_mix)
+     return mhc_post(x, residual, post_layer_mix, comb_res_mix)
+ 
+diff --git a/python/sglang/kernels/ops/layernorm/mhc_sm120_triton.py b/python/sglang/kernels/ops/layernorm/mhc_sm120_triton.py
+new file mode 100644
+index 0000000000..95aabe854e
+--- /dev/null
++++ b/python/sglang/kernels/ops/layernorm/mhc_sm120_triton.py
+@@ -0,0 +1,149 @@
++"""Fused Triton tail for mhc_pre, for SM120 where the TileLang path cannot build.
++
++The torch reference runs the post-GEMM part as ~50 separate kernels, 40 of them
++the Sinkhorn loop operating on an (s, n, n) tensor of 96 floats. This collapses
++everything after F.linear into one kernel: one program per row, the n*n block
++held in registers for the whole Sinkhorn loop.
++
++The GEMM itself stays in cuBLAS -- it is memory bound on hc_fn and fusing it
++buys nothing.
++"""
++import torch
++import triton
++import triton.language as tl
++
++
++@triton.jit
++def _mhc_pre_tail_kernel(
++    mixes_ptr, rsqrt_ptr, scale_ptr, base_ptr,
++    pre_ptr, post_ptr, comb_ptr,
++    n_rows, mixes_stride,
++    hc_pre_eps, hc_sinkhorn_eps, hc_post_mult,
++    SINKHORN: tl.constexpr, N: tl.constexpr,
++):
++    row = tl.program_id(0)
++    if row >= n_rows:
++        return
++
++    r = tl.load(rsqrt_ptr + row)
++    offs = tl.arange(0, N)
++    base_off = row * mixes_stride
++
++    sc0 = tl.load(scale_ptr + 0)
++    sc1 = tl.load(scale_ptr + 1)
++    sc2 = tl.load(scale_ptr + 2)
++
++    pre_raw = tl.load(mixes_ptr + base_off + offs) * r
++    post_raw = tl.load(mixes_ptr + base_off + N + offs) * r
++    pre_base = tl.load(base_ptr + offs)
++    post_base = tl.load(base_ptr + N + offs)
++
++    pre = tl.sigmoid(pre_raw * sc0 + pre_base) + hc_pre_eps
++    post = hc_post_mult * tl.sigmoid(post_raw * sc1 + post_base)
++
++    ij = offs[:, None] * N + offs[None, :]
++    comb = tl.load(mixes_ptr + base_off + 2 * N + ij) * r
++    comb = comb * sc2 + tl.load(base_ptr + 2 * N + ij)
++
++    # softmax over the last dim
++    mx = tl.max(comb, axis=1)[:, None]
++    e = tl.exp(comb - mx)
++    comb = e / tl.sum(e, axis=1)[:, None]
++    comb = comb + hc_sinkhorn_eps
++
++    # Sinkhorn: the whole loop stays in registers
++    comb = comb / (tl.sum(comb, axis=0)[None, :] + hc_sinkhorn_eps)
++    for _ in tl.static_range(SINKHORN - 1):
++        comb = comb / (tl.sum(comb, axis=1)[:, None] + hc_sinkhorn_eps)
++        comb = comb / (tl.sum(comb, axis=0)[None, :] + hc_sinkhorn_eps)
++
++    tl.store(pre_ptr + row * N + offs, pre)
++    tl.store(post_ptr + row * N + offs, post)
++    tl.store(comb_ptr + row * N * N + ij, comb)
++
++
++def mhc_pre_triton(residual, fn, hc_scale, hc_base, rms_eps, hc_pre_eps,
++                   hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat):
++    """Drop-in replacement for _mhc_pre_torch. residual: (s, n, h)."""
++    s, n, h = residual.shape
++    assert n & (n - 1) == 0, f"n must be a power of two for the fused kernel, got {n}"
++    dtype = residual.dtype
++
++    x_flat = residual.view(s, n * h).float()
++    rsqrt = torch.rsqrt(x_flat.square().mean(-1, keepdim=True) + rms_eps)
++    mixes = torch.nn.functional.linear(x_flat, fn)      # (s, 2n + n*n), no *rsqrt yet
++
++    pre = torch.empty((s, n), device=residual.device, dtype=torch.float32)
++    post = torch.empty((s, n), device=residual.device, dtype=torch.float32)
++    comb = torch.empty((s, n, n), device=residual.device, dtype=torch.float32)
++
++    _mhc_pre_tail_kernel[(s,)](
++        mixes, rsqrt, hc_scale, hc_base,
++        pre, post, comb,
++        s, mixes.stride(0),
++        hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value,
++        SINKHORN=sinkhorn_repeat, N=n,
++        num_warps=1,
++    )
++
++    layer_input = (pre.unsqueeze(-1) * residual.float()).sum(dim=1).to(dtype)
++    return post.unsqueeze(-1), comb, layer_input
++
++
++@triton.jit
++def _mhc_post_kernel(
++    x_ptr, res_ptr, post_ptr, comb_ptr, out_ptr,
++    n_tok, H,
++    BLOCK_H: tl.constexpr, N: tl.constexpr,
++):
++    """out[s,b,h] = post[s,b]*x[s,h] + sum_a comb[s,a,b]*residual[s,a,h]
++
++    The torch reference materialises an (s, n, n, h) outer product before the
++    reduction; here the n*n mixing matrix stays in registers and each program
++    streams one BLOCK_H slice of one token.
++    """
++    s = tl.program_id(0)
++    hb = tl.program_id(1)
++    if s >= n_tok:
++        return
++
++    offs_h = hb * BLOCK_H + tl.arange(0, BLOCK_H)
++    mask_h = offs_h < H
++    offs_n = tl.arange(0, N)
++
++    xv = tl.load(x_ptr + s * H + offs_h, mask=mask_h, other=0.0).to(tl.float32)
++    post = tl.load(post_ptr + s * N + offs_n).to(tl.float32)          # (N,)
++    comb = tl.load(comb_ptr + s * N * N + offs_n[:, None] * N + offs_n[None, :]).to(tl.float32)
++
++    # residual rows for this token: (N, BLOCK_H)
++    res = tl.load(
++        res_ptr + s * N * H + offs_n[:, None] * H + offs_h[None, :],
++        mask=mask_h[None, :], other=0.0,
++    ).to(tl.float32)
++
++    # out[b, :] = post[b] * x + sum_a comb[a, b] * res[a, :]
++    acc = tl.sum(comb[:, :, None] * res[:, None, :], axis=0)          # (N, BLOCK_H)
++    acc = acc + post[:, None] * xv[None, :]
++
++    tl.store(
++        out_ptr + s * N * H + offs_n[:, None] * H + offs_h[None, :],
++        acc.to(out_ptr.dtype.element_ty),
++        mask=mask_h[None, :],
++    )
++
++
++def mhc_post_triton(x, residual, post_layer_mix, comb_res_mix, hc_mult):
++    """Drop-in for _mhc_post_torch. x:(s,h) residual:(s,n,h) -> (s,n,h)."""
++    s, h = x.shape
++    n = hc_mult
++    assert n & (n - 1) == 0, f"n must be a power of two, got {n}"
++    out = torch.empty((s, n, h), device=x.device, dtype=x.dtype)
++    if s == 0:
++        return out
++    BLOCK_H = 512
++    grid = (s, triton.cdiv(h, BLOCK_H))
++    _mhc_post_kernel[grid](
++        x, residual, post_layer_mix, comb_res_mix, out,
++        s, h, BLOCK_H=BLOCK_H, N=n, num_warps=4,
++    )
++    return out
+diff --git a/python/sglang/srt/arg_groups/overrides.py b/python/sglang/srt/arg_groups/overrides.py
+index 4efb6217ee..c88fa419ff 100644
+--- a/python/sglang/srt/arg_groups/overrides.py
++++ b/python/sglang/srt/arg_groups/overrides.py
+@@ -1984,7 +1984,12 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
+     declared: Dict[str, Any] = {}
+     model_arch = hf_config.architectures[0]
+     is_glm_sm12_fp8 = (
+-        model_arch == "GlmMoeDsaForCausalLM"
++        model_arch in (
++            "GlmMoeDsaForCausalLM",
++            "GlmMoeDsaForCausalLMNextN",
++            "Glm5NextForConditionalGeneration",
++            "Glm5NextForConditionalGenerationNextN",
++        )
+         and major == 12
+         and kv_cache_dtype == "fp8_e4m3"
+         and not is_hip()
+diff --git a/python/sglang/srt/disaggregation/decode_kvcache_offload_manager.py b/python/sglang/srt/disaggregation/decode_kvcache_offload_manager.py
+index 2ad219ab88..50168c6a43 100644
+--- a/python/sglang/srt/disaggregation/decode_kvcache_offload_manager.py
++++ b/python/sglang/srt/disaggregation/decode_kvcache_offload_manager.py
+@@ -61,11 +61,16 @@ class DecodeKVCacheOffloadManager:
+         kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
+         if not isinstance(kv_cache, (MHATokenToKVPool, MLATokenToKVPool)):
+             raise ValueError("Unsupported KV cache type for decode offload")
++        use_mla = isinstance(kv_cache, MLATokenToKVPool)
+         self.decode_host_mem_pool = build_kv_host_pool(
+             kv_pool=kv_cache,
+             page_size=self.page_size,
+             server_args=server_args,
+-            use_mla=isinstance(kv_cache, MLATokenToKVPool),
++            use_mla=use_mla,
++            # Host rows must have the device pool's row geometry; a packed DSA
++            # row is wider than the width the MLA host pool assumes without
++            # the override.
++            override_kv_cache_dim=kv_cache.kv_cache_dim if use_mla else None,
+         )
+ 
+         self.tp_group = tp_group
+diff --git a/python/sglang/srt/layers/communicator_mhc.py b/python/sglang/srt/layers/communicator_mhc.py
+index b32952ae10..27651d5f88 100644
+--- a/python/sglang/srt/layers/communicator_mhc.py
++++ b/python/sglang/srt/layers/communicator_mhc.py
+@@ -52,10 +52,12 @@ from sglang.srt.layers.dp_attention import (
+     dp_gather_replicate,
+     dp_reduce_scatter_tensor,
+     dp_scatter,
++    get_dp_global_num_tokens,
+     get_global_dp_buffer,
+     get_local_dp_buffer_mhc,
+     is_allocation_symmetric,
+ )
++from sglang.srt.layers.moe import should_use_dp_reduce_scatterv
+ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+ 
+ 
+@@ -339,7 +341,15 @@ class MHCCommunicateSummableTensorPairFn(CommunicateSummableTensorPairFn):
+             get_local_dp_buffer_mhc(get_tp_group(), 1),
+             hidden_states,
+         )
+-        if allow_reduce_scatter and forward_batch.dp_padding_mode.is_max_len():
++        # MoE skips its post-expert all-reduce with reduce_scatterv, so this
++        # scatter must reduce while combining local-expert partial sums.
++        if should_use_dp_reduce_scatterv():
++            get_tp_group().reduce_scatterv(
++                global_hidden_states,
++                output=hidden_states,
++                sizes=get_dp_global_num_tokens(),
++            )
++        elif allow_reduce_scatter and forward_batch.dp_padding_mode.is_max_len():
+             dp_reduce_scatter_tensor(hidden_states, global_hidden_states)
+         else:
+             dp_scatter(hidden_states, global_hidden_states, forward_batch)
+@@ -553,9 +563,13 @@ class MHCLayerCommunicator(LayerCommunicator):
+         if (
+             self._communicate_summable_tensor_pair_fn
+             is MHCCommunicateSummableTensorPairFn._scatter_hidden_states
+-            and forward_batch.dp_padding_mode.is_max_len()
+         ):
+-            return True
++            # reduce_scatterv already combines expert outputs; returning False
++            # would make RowParallelLinear perform an extra all-reduce.
++            if should_use_dp_reduce_scatterv():
++                return True
++            if forward_batch.dp_padding_mode.is_max_len():
++                return True
+ 
+         if dsa_use_prefill_cp(forward_batch):
+             return True
+diff --git a/python/sglang/srt/layers/moe/fused_moe_triton/layer.py b/python/sglang/srt/layers/moe/fused_moe_triton/layer.py
+index 30d688ee47..7b9bc29174 100644
+--- a/python/sglang/srt/layers/moe/fused_moe_triton/layer.py
++++ b/python/sglang/srt/layers/moe/fused_moe_triton/layer.py
+@@ -2268,9 +2268,16 @@ class FusedMoE(torch.nn.Module):
+           
+     def _get_max_num_seqs(self) -> int:
+         if self.speculative_num_draft_tokens is not None and self.speculative_num_draft_tokens > 0:
+-            batch_size = self.max_running_requests * (
+-                1 + self.speculative_num_draft_tokens
+-            )
++            server_args = get_server_args()
++            max_spec_tokens = server_args.max_speculative_num_draft_tokens
++            if server_args.speculative_adaptive and max_spec_tokens is not None:
++                # Adaptive spec may run target-verify / draft-extend graphs
++                # with up to (1 + max candidate step) tokens per request; the
++                # base draft-token count under-sizes those batches.
++                tokens_per_req = max_spec_tokens
++            else:
++                tokens_per_req = 1 + self.speculative_num_draft_tokens
++            batch_size = self.max_running_requests * tokens_per_req
+         else:
+             batch_size = self.max_running_requests
+         
+diff --git a/python/sglang/srt/layers/moe/moe_runner/deep_gemm.py b/python/sglang/srt/layers/moe/moe_runner/deep_gemm.py
+index fd9c0211aa..51e3631393 100644
+--- a/python/sglang/srt/layers/moe/moe_runner/deep_gemm.py
++++ b/python/sglang/srt/layers/moe/moe_runner/deep_gemm.py
+@@ -1413,9 +1413,9 @@ def _apply_swiglu_limit(
+     assert gate.shape == (num_tokens, hidden_size_x2 // 2)
+     assert up.shape == (num_tokens, hidden_size_x2 // 2)
+ 
+-    up = torch.clamp(up, min=-swiglu_limit, max=swiglu_limit)
+-    gate = torch.clamp(gate, max=swiglu_limit)
+-
+-    out = torch.cat([gate, up], dim=-1)
+-    assert out.shape == (num_tokens, hidden_size_x2)
+-    return out
++    # Both halves are views of a fresh GEMM output. Avoid separate clamped
++    # copies and their concatenation: large compact prefills need that
++    # headroom for the activation and down-projection workspaces.
++    up.clamp_(min=-swiglu_limit, max=swiglu_limit)
++    gate.clamp_(max=swiglu_limit)
++    return gateup_output
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index 45460e2e6d..ed406523da 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -1027,6 +1027,16 @@ class Scheduler(
+         if self.server_args.is_startup_weight_load_overlap:
+             self.tp_worker.finalize_startup_weight_load()
+ 
++        # Adaptive/speculative graphs and post-capture KV sizing can consume
++        # the headroom seen by the initial DeepGEMM layout budget. Refresh it
++        # after these allocations, before elastic EP rejoins healthy ranks
++        # that do not participate in this startup collective.
++        from sglang.srt.model_executor.model_runner_components.cuda_graph_setup import (
++            refresh_deep_gemm_layout_memory_budget,
++        )
++
++        refresh_deep_gemm_layout_memory_budget(model_runner, only_if_initialized=True)
++
+         if (
+             get_exec().moe.elastic_ep_backend is not None
+             and get_exec().moe.ep_join_mode == "recover"
+diff --git a/python/sglang/srt/mem_cache/hisparse_memory_pool.py b/python/sglang/srt/mem_cache/hisparse_memory_pool.py
+index ad45ce76a1..4808dadd34 100644
+--- a/python/sglang/srt/mem_cache/hisparse_memory_pool.py
++++ b/python/sglang/srt/mem_cache/hisparse_memory_pool.py
+@@ -40,6 +40,11 @@ class HiSparseDSATokenToKVPool(DSATokenToKVPool):
+         kv_cache_dim: int,
+         start_layer: Optional[int] = None,
+         end_layer: Optional[int] = None,
++        index_kpool: int = 1,
++        index_kpool_compress: bool = False,
++        tail_extra_slots: int = 0,
++        max_running_requests: Optional[int] = None,
++        skip_topk_layers: Optional[list[bool]] = None,
+         host_to_device_ratio: int = 2,
+     ):
+         super().__init__(
+@@ -56,6 +61,11 @@ class HiSparseDSATokenToKVPool(DSATokenToKVPool):
+             start_layer=start_layer,
+             end_layer=end_layer,
+             index_buf_size=size * host_to_device_ratio,
++            index_kpool=index_kpool,
++            index_kpool_compress=index_kpool_compress,
++            tail_extra_slots=tail_extra_slots,
++            max_running_requests=max_running_requests,
++            skip_topk_layers=skip_topk_layers,
+         )
+         self.bytes_per_token = self.kv_cache_dim * self.dtype.itemsize
+ 
+diff --git a/python/sglang/srt/mem_cache/hybrid_cache/hybrid_pool_assembler.py b/python/sglang/srt/mem_cache/hybrid_cache/hybrid_pool_assembler.py
+index 2b38326b01..3f5b891566 100644
+--- a/python/sglang/srt/mem_cache/hybrid_cache/hybrid_pool_assembler.py
++++ b/python/sglang/srt/mem_cache/hybrid_cache/hybrid_pool_assembler.py
+@@ -692,6 +692,59 @@ def build_deepseek_v4_hicache_stack(
+     return host_pool_group, cache_controller
+ 
+ 
++def _hybrid_dsa_index_buffers(kv_pool, draft_pools=()):
++    """Keep index buffers layer-aligned, including empty shared-topk layers."""
++    from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
++
++    if not isinstance(kv_pool, DSATokenToKVPool):
++        return []
++    return [
++        buffer
++        for pool in (kv_pool, *draft_pools)
++        for buffer in pool.index_k_with_scale_buffer
++    ]
++
++
++def _build_hybrid_dsa_index_entry(
++    *, kv_pool, kv_host_pool, layer_mapping, transfer_layer_num, draft_pools=()
++):
++    buffers = _hybrid_dsa_index_buffers(kv_pool, draft_pools)
++    live_layers = [i for i, buffer in enumerate(buffers) if buffer.numel()]
++    if not live_layers:
++        return None
++    compact_layers = {layer: i for i, layer in enumerate(live_layers)}
++    live_buffers = [buffers[i] for i in live_layers]
++    item_bytes = live_buffers[0].shape[1] * live_buffers[0].element_size()
++    if any(b.shape[1] * b.element_size() != item_bytes for b in live_buffers):
++        raise ValueError("Hybrid DSA index buffers must have the same page row width.")
++    # The paged pool transfers explicit byte rows, so shared-topk layers with
++    # zero-row placeholders can be omitted without dereferencing a null pointer.
++    # KV-derived physical page indices remain valid for compressed index rows
++    # when the radix tree only shares complete compression groups.
++    host_pool = DeepSeekV4PagedHostPool(
++        pool_name=str(PoolName.INDEXER),
++        device_buffers=live_buffers,
++        item_bytes=item_bytes,
++        num_host_pages=kv_host_pool.page_num,
++        slot_page_size=kv_pool.page_size,
++        layout=get_memory().hicache_mem_layout,
++        allocator_type=_get_allocator_type(),
++        page_aligned_only=True,
++    )
++    return build_pool_entry(
++        name=PoolName.INDEXER,
++        host_pool=host_pool,
++        device_pool=kv_pool,
++        layer_mapping={
++            global_layer: compact_layers[local_layer]
++            for global_layer, local_layer in layer_mapping.items()
++            if local_layer in compact_layers
++        },
++        transfer_layer_num=transfer_layer_num,
++        packed_draft_device_pools=draft_pools,
++    )
++
++
+ def build_hybrid_mamba_stack(
+     *,
+     params: CacheInitParams,
+@@ -712,19 +765,43 @@ def build_hybrid_mamba_stack(
+ ) -> tuple[HostPoolGroup, HybridCacheController]:
+     transfer_layer_num = len(full_layer_mapping | mamba_layer_mapping)
+     mamba_allocator = params.req_to_token_pool.mamba_allocator
++    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
++
++    # Hybrid drafts wrap attention KV in HybridLinearKVPool; DSA drafts are bare pools.
+     mtp_draft_device_pools = tuple(
+-        pool.full_kv_pool for pool in params.mtp_draft_device_pools
++        pool.full_kv_pool if isinstance(pool, HybridLinearKVPool) else pool
++        for pool in params.mtp_draft_device_pools
+     )
+     kv_host_size, mamba_host_size = None, 0
+     if get_memory().hicache_size > 0:
+         kv_host_size, mamba_host_size = _split_hicache_size(
+             get_memory().hicache_size, (kv_pool, mamba_pool)
+         )
++        index_buffers = _hybrid_dsa_index_buffers(kv_pool, mtp_draft_device_pools)
++        if index_buffers:
++            kv_bytes_per_token = sum(
++                pool.kv_cache_dim * pool.store_dtype.itemsize * pool.layer_num
++                for pool in (kv_pool, *mtp_draft_device_pools)
++            )
++            index_bytes_per_token = sum(
++                b.shape[1] * b.element_size() / kv_pool.page_size
++                for b in index_buffers
++                if b.numel()
++            )
++            # The KV and index host pools share a token capacity and together
++            # consume the KV share of --hicache-size, not two separate budgets.
++            kv_host_size *= kv_bytes_per_token / (
++                kv_bytes_per_token + index_bytes_per_token
++            )
+     kv_host_pool = build_kv_host_pool(
+         kv_pool=kv_pool,
+         page_size=params.page_size,
+         server_args=server_args,
+         use_mla=use_mla,
++        # Host rows must have the device pool's row geometry. A packed DSA
++        # row is wider than kv_lora_rank + qk_rope_head_dim, the width the
++        # MLA host pool assumes without the override.
++        override_kv_cache_dim=kv_pool.kv_cache_dim if use_mla else None,
+         host_size=kv_host_size,
+         mtp_draft_device_pools=mtp_draft_device_pools,
+     )
+@@ -764,6 +841,15 @@ def build_hybrid_mamba_stack(
+             device_free_fn=mamba_allocator.free,
+         ),
+     ]
++    index_entry = _build_hybrid_dsa_index_entry(
++        kv_pool=kv_pool,
++        kv_host_pool=kv_host_pool,
++        layer_mapping=full_layer_mapping,
++        transfer_layer_num=transfer_layer_num + len(mtp_draft_device_pools),
++        draft_pools=mtp_draft_device_pools,
++    )
++    if index_entry is not None:
++        entries.append(index_entry)
+     host_pool_group = HostPoolGroup(entries)
+     cache_controller = HybridCacheController(
+         params.token_to_kv_pool_allocator,
+@@ -1321,6 +1407,7 @@ class _MambaStrategy(StackStrategy):
+             storage_backend_extra_config=storage_backend_extra_config,
+             enable_storage_metrics=enable_storage_metrics,
+         )
++        has_indexer = PoolName.INDEXER in host_pool_group.entry_map
+         return StackBuildResult(
+             host_pool_group=host_pool_group,
+             cache_controller=cache_controller,
+@@ -1330,7 +1417,16 @@ class _MambaStrategy(StackStrategy):
+             },
+             register_req_to_token_counter=True,
+             transfer_layer_num=len(full_layer_mapping | mamba_layer_mapping),
+-            pools_desc="KV + MAMBA",
++            sidecars=(
++                [
++                    SidecarPoolSpec(
++                        pool_name=PoolName.INDEXER, indices_from_pool=PoolName.KV
++                    )
++                ]
++                if has_indexer
++                else []
++            ),
++            pools_desc="KV + MAMBA + INDEXER" if has_indexer else "KV + MAMBA",
+         )
+ 
+ 
+diff --git a/python/sglang/srt/mem_cache/memory_pool_host.py b/python/sglang/srt/mem_cache/memory_pool_host.py
+index 2ffb5b4b32..302d992dd0 100644
+--- a/python/sglang/srt/mem_cache/memory_pool_host.py
++++ b/python/sglang/srt/mem_cache/memory_pool_host.py
+@@ -185,10 +185,15 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
+         device: str = "cpu",
+         pin_memory: bool = True,
+         allocator_type: str = "default",
++        page_aligned_only: bool = False,
+     ):
+         self.pool_name = pool_name
+         self.layer_num = len(device_buffers)
+         self.item_bytes = item_bytes
++        # A page row of the FP4 indexer buffers is a grouped slot layout rather
++        # than a flat token array, so the token-granular copy used for fused
++        # DSv4 C4 rows does not apply and only whole pages may move.
++        self.page_aligned_only = page_aligned_only
+         self.num_host_pages = num_host_pages
+         self.slot_page_size = slot_page_size
+         self.dtype = torch.uint8
+@@ -303,6 +308,15 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
+     def _to_page_indices(self, indices: torch.Tensor) -> torch.Tensor:
+         return indices.reshape(-1, self.slot_page_size)[:, 0] // self.slot_page_size
+ 
++    def _unaligned_transfer_error(
++        self, host_indices: torch.Tensor, device_indices: torch.Tensor
++    ) -> ValueError:
++        return ValueError(
++            f"{self.pool_name} expects page-aligned indices: got "
++            f"{host_indices.numel()} host and {device_indices.numel()} device "
++            f"indices for page size {self.slot_page_size}."
++        )
++
+     def _has_transfer_indices(
+         self, host_indices: torch.Tensor | None, device_indices: torch.Tensor | None
+     ) -> bool:
+@@ -373,6 +387,8 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
+             # Token-granular DSV4 C4 copy needs this helper because a token is
+             # not one contiguous byte range in the paged row:
+             # [value0..value63][scale0..scale63].
++            if self.page_aligned_only:
++                raise self._unaligned_transfer_error(host_indices, device_indices)
+             transfer_cache_dsv4_mla(
+                 src_ptrs=self.device_ptrs,
+                 dst_ptrs=self.data_ptrs,
+@@ -451,6 +467,8 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
+         ):
+             # Same DSV4 C4 layout issue as backup: this is token-granular
+             # preload, so it cannot use the normal HiCache page-row copy.
++            if self.page_aligned_only:
++                raise self._unaligned_transfer_error(host_indices, device_indices)
+             transfer_cache_dsv4_mla(
+                 src_ptrs=self.data_ptrs[layer_id : layer_id + 1],
+                 dst_ptrs=self.device_ptrs[layer_id : layer_id + 1],
+diff --git a/python/sglang/srt/mem_cache/pool_host/mla.py b/python/sglang/srt/mem_cache/pool_host/mla.py
+index 440d46401b..74f1885e42 100644
+--- a/python/sglang/srt/mem_cache/pool_host/mla.py
++++ b/python/sglang/srt/mem_cache/pool_host/mla.py
+@@ -71,6 +71,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
+     ):
+         self.override_kv_cache_dim = override_kv_cache_dim
+         self.mtp_draft_device_pools = tuple(mtp_draft_device_pools)
++        self._check_host_row_geometry(device_pool, pool_label)
+         super().__init__(
+             device_pool,
+             host_to_device_ratio,
+@@ -114,6 +115,51 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
+             ]
+         self._init_write_back_staging_buffers()
+ 
++    def _host_kv_cache_dim(self, device_pool) -> int:
++        """Row width, in store dtype elements, of every host row."""
++        return self.override_kv_cache_dim or (
++            device_pool.kv_lora_rank + device_pool.qk_rope_head_dim
++        )
++
++    def _check_host_row_geometry(self, device_pool, pool_label: str) -> None:
++        """Reject a host row geometry that differs from the device rows.
++
++        The host buffer has a single row width and dtype for every layer, and
++        the transfer paths address the target and packed MTP draft device
++        rows with that same geometry (the kernel paths use the host stride
++        for both sides, the direct path copies row slices). The host row must
++        therefore match the target's row, and every packed draft pool must
++        have the target's row geometry. Runs before any host allocation.
++        """
++        host_dim = self._host_kv_cache_dim(device_pool)
++        target_dtype = device_pool.store_dtype
++        # MLATokenToKVPool and its subclasses always set kv_cache_dim (a packed
++        # DSA row is wider than kv_lora_rank + qk_rope_head_dim). Duck-typed
++        # device pools that do not model row packing, such as lightweight test
++        # doubles, may omit it; only then is the host width taken on trust.
++        target_dim = getattr(device_pool, "kv_cache_dim", host_dim)
++        if host_dim != target_dim:
++            raise ValueError(
++                f"HiCache {pool_label} host pool rows must have the device "
++                f"pool's row geometry, but the host row is kv_cache_dim="
++                f"{host_dim} while the device pool has kv_cache_dim="
++                f"{target_dim}. Construct the host pool with "
++                "override_kv_cache_dim=device_pool.kv_cache_dim."
++            )
++        for draft_id, draft_pool in enumerate(self.mtp_draft_device_pools):
++            draft_dtype = draft_pool.store_dtype
++            draft_dim = draft_pool.kv_cache_dim
++            if draft_dtype != target_dtype or draft_dim != target_dim:
++                raise ValueError(
++                    f"HiCache {pool_label} host pool packs MTP draft KV layers "
++                    "next to the target layers, so every draft pool must have "
++                    f"the target's row geometry; draft pool {draft_id} has "
++                    f"store_dtype={draft_dtype}, kv_cache_dim={draft_dim} but "
++                    f"the target has store_dtype={target_dtype}, "
++                    f"kv_cache_dim={target_dim}. Use the same --kv-cache-dtype "
++                    "and --speculative-draft-kv-cache-dtype."
++                )
++
+     def get_contiguous_buf_infos(self):
+         """Return (data_ptrs, data_lens, item_lens) in the same format as device pool,
+         for registering host memory with the disaggregation transfer engine."""
+@@ -127,9 +173,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
+         self.qk_rope_head_dim = self.device_pool.qk_rope_head_dim
+         self.target_layer_num = self._effective_host_layer_num()
+         self.layer_num = self.target_layer_num + len(self.mtp_draft_device_pools)
+-        self.kv_cache_dim = self.override_kv_cache_dim or (
+-            self.kv_lora_rank + self.qk_rope_head_dim
+-        )
++        self.kv_cache_dim = self._host_kv_cache_dim(self.device_pool)
+         return self.kv_cache_dim * self.dtype.itemsize * self.layer_num
+ 
+     def get_ksize_per_token(self):
+diff --git a/python/sglang/srt/mem_cache/unified_radix_cache.py b/python/sglang/srt/mem_cache/unified_radix_cache.py
+index 1a7429e84b..799b30c85b 100644
+--- a/python/sglang/srt/mem_cache/unified_radix_cache.py
++++ b/python/sglang/srt/mem_cache/unified_radix_cache.py
+@@ -2,6 +2,7 @@ from __future__ import annotations
+ 
+ import atexit
+ import logging
++import math
+ import threading
+ import time
+ from dataclasses import replace
+@@ -118,6 +119,26 @@ COMPONENT_REGISTRY: dict[ComponentType, type[TreeComponent]] = {
+ logger = logging.getLogger(__name__)
+ 
+ 
++def _compressed_index_tree_params(params: CacheInitParams) -> CacheInitParams:
++    """Separate compressed-index ownership from physical KV transfer pages."""
++    from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, HybridLinearKVPool
++
++    if params.disable or params.token_to_kv_pool_allocator is None:
++        return params
++    pool = params.token_to_kv_pool_allocator.get_kvcache()
++    if not isinstance(pool, HybridLinearKVPool):
++        return params
++    pool = pool.full_kv_pool
++    if not isinstance(pool, DSATokenToKVPool) or not pool.kpool_use_compress:
++        return params
++    # One compressed index row contains page_size pooled keys, stored in the
++    # first physical KV page of page_size * index_kpool logical tokens. A split
++    # inside that group would let children overwrite their parent's index row,
++    # including after that row has already been backed up to host memory.
++    tree_page = math.lcm(params.page_size, pool.page_size * pool.index_kpool)
++    return replace(params, page_size=tree_page)
++
++
+ class _OngoingWriteThrough(NamedTuple):
+     """Tracks an in-flight D→H write-through operation."""
+ 
+@@ -150,6 +171,11 @@ class UnifiedRadixCache(BasePrefixCache):
+         self,
+         params: CacheInitParams,
+     ):
++        # Only tree/component ownership is widened. init_hicache receives the
++        # original params, so host copies and the allocator still use physical
++        # KV pages, which need not be contiguous across a compression group.
++        self._transfer_page_size = params.page_size
++        params = _compressed_index_tree_params(params)
+         self.req_to_token_pool = params.req_to_token_pool
+         self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator
+         self.disable = params.disable
+@@ -387,6 +413,11 @@ class UnifiedRadixCache(BasePrefixCache):
+ 
+         # Parse storage config once, share with assembler and tree
+         storage_backend = get_memory().hicache_storage_backend
++        if storage_backend is not None and self.page_size != params.page_size:
++            raise ValueError(
++                "Compressed hybrid DSA currently supports L2 HiCache only; "
++                "storage hashes and transfers require matching page sizes."
++            )
+         storage_extra_config = None
+         storage_prefetch_threshold = 256
+         prefetch_timeout_base = 1.0
+@@ -2405,6 +2436,8 @@ class UnifiedRadixCache(BasePrefixCache):
+                 "HiCache is not initialized; launch with "
+                 "--enable-hierarchical-cache to attach a storage backend.",
+             )
++        if self.page_size != self.cache_controller.page_size:
++            return False, "Compressed hybrid DSA currently supports L2 HiCache only."
+         return self._storage_attachment.attach(
+             storage_backend=storage_backend,
+             storage_backend_extra_config_json=storage_backend_extra_config_json,
+diff --git a/python/sglang/srt/model_executor/model_runner_components/cuda_graph_setup.py b/python/sglang/srt/model_executor/model_runner_components/cuda_graph_setup.py
+index aecb958966..94d39eaa45 100644
+--- a/python/sglang/srt/model_executor/model_runner_components/cuda_graph_setup.py
++++ b/python/sglang/srt/model_executor/model_runner_components/cuda_graph_setup.py
+@@ -56,6 +56,11 @@ if TYPE_CHECKING:
+ 
+ logger = logging.getLogger(__name__)
+ 
++# Whether the DeepGEMM masked-standard-layout budget was set during capture.
++# The target and draft runners share the budget, so the guard is rank-uniform
++# across them.
++_deep_gemm_layout_memory_budget_initialized = False
++
+ 
+ class GraphCapture(msgspec.Struct, frozen=True, kw_only=True):
+     runner: Optional[BaseRunner]
+@@ -92,6 +97,75 @@ class CudaGraphsCapture(msgspec.Struct, frozen=True, kw_only=True):
+         )
+ 
+ 
++def refresh_deep_gemm_layout_memory_budget(
++    model_runner: ModelRunner, *, only_if_initialized: bool = False
++) -> None:
++    """Set the all-rank budget before capture, then refresh after startup."""
++    global _deep_gemm_layout_memory_budget_initialized
++    if (
++        model_runner.device != "cuda"
++        or envs.SGLANG_DEEPGEMM_STANDARD_LAYOUT.get().lower() != "auto"
++    ):
++        return
++
++    if only_if_initialized:
++        # Target and draft share the budget. Its pre-capture initialization
++        # already used a world-wide collective, so this guard is rank-uniform
++        # and also covers a draft-only DeepGEMM backend outside draft context.
++        if not _deep_gemm_layout_memory_budget_initialized:
++            return
++    else:
++        if model_runner.is_draft_worker:
++            moe_runner_backend = (
++                get_spec().speculative_moe_runner_backend
++                or get_exec().moe.moe_runner_backend
++            )
++            moe_a2a_backend = (
++                get_spec().speculative_moe_a2a_backend or get_exec().moe.moe_a2a_backend
++            )
++        else:
++            moe_runner_backend = get_exec().moe.moe_runner_backend
++            moe_a2a_backend = get_exec().moe.moe_a2a_backend
++
++        uses_deep_gemm_moe_runner = moe_runner_backend == "deep_gemm"
++        if moe_runner_backend == "auto" and model_runner.model_config.quantization in (
++            "fp8",
++            "mxfp8",
++        ):
++            from sglang.srt.layers.moe.utils import MoeA2ABackend, MoeRunnerBackend
++            from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
++
++            uses_deep_gemm_moe_runner = (
++                Fp8MoEMethod.is_deepgemm_moe_runner_backend_enabled(
++                    MoeRunnerBackend(moe_runner_backend),
++                    MoeA2ABackend(moe_a2a_backend),
++                )
++            )
++        if not uses_deep_gemm_moe_runner:
++            return
++
++    from sglang.srt.layers.moe.moe_runner.deep_gemm import (
++        set_masked_standard_layout_memory_budget,
++    )
++
++    world_group = get_world_group()
++    available_memory_gb = get_available_gpu_memory(
++        model_runner.device,
++        model_runner.gpu_id,
++        distributed=world_group.world_size > 1,
++        cpu_group=world_group.cpu_group,
++    )
++    budget_bytes = set_masked_standard_layout_memory_budget(
++        int(available_memory_gb * (1 << 30))
++    )
++    _deep_gemm_layout_memory_budget_initialized = True
++    logger.info(
++        "DeepGEMM masked layout budget: %.2f GiB from %.2f GiB free.",
++        budget_bytes / (1 << 30),
++        available_memory_gb,
++    )
++
++
+ def capture_cuda_graphs(
+     *, model_runner: ModelRunner, capture_decode_cuda_graph: bool = True
+ ) -> CudaGraphsCapture:
+@@ -115,55 +189,7 @@ def capture_cuda_graphs(
+     # batch.
+     eager_runner = EagerRunner(model_runner)
+ 
+-    if model_runner.is_draft_worker:
+-        moe_runner_backend = (
+-            get_spec().speculative_moe_runner_backend
+-            or get_exec().moe.moe_runner_backend
+-        )
+-        moe_a2a_backend = (
+-            get_spec().speculative_moe_a2a_backend or get_exec().moe.moe_a2a_backend
+-        )
+-    else:
+-        moe_runner_backend = get_exec().moe.moe_runner_backend
+-        moe_a2a_backend = get_exec().moe.moe_a2a_backend
+-
+-    uses_deep_gemm_moe_runner = moe_runner_backend == "deep_gemm"
+-    if moe_runner_backend == "auto" and model_runner.model_config.quantization in (
+-        "fp8",
+-        "mxfp8",
+-    ):
+-        from sglang.srt.layers.moe.utils import MoeA2ABackend, MoeRunnerBackend
+-        from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
+-
+-        uses_deep_gemm_moe_runner = Fp8MoEMethod.is_deepgemm_moe_runner_backend_enabled(
+-            MoeRunnerBackend(moe_runner_backend),
+-            MoeA2ABackend(moe_a2a_backend),
+-        )
+-
+-    if (
+-        model_runner.device == "cuda"
+-        and envs.SGLANG_DEEPGEMM_STANDARD_LAYOUT.get().lower() == "auto"
+-        and uses_deep_gemm_moe_runner
+-    ):
+-        from sglang.srt.layers.moe.moe_runner.deep_gemm import (
+-            set_masked_standard_layout_memory_budget,
+-        )
+-
+-        world_group = get_world_group()
+-        available_memory_gb = get_available_gpu_memory(
+-            model_runner.device,
+-            model_runner.gpu_id,
+-            distributed=world_group.world_size > 1,
+-            cpu_group=world_group.cpu_group,
+-        )
+-        budget_bytes = set_masked_standard_layout_memory_budget(
+-            int(available_memory_gb * (1 << 30))
+-        )
+-        logger.info(
+-            "DeepGEMM masked layout budget: %.2f GiB from %.2f GiB free.",
+-            budget_bytes / (1 << 30),
+-            available_memory_gb,
+-        )
++    refresh_deep_gemm_layout_memory_budget(model_runner)
+ 
+     # cuda-graph capture: prefill before decode, so both coalesce onto the
+     # eager buffer allocated above. (capture_prefill_graph routes prefill
+diff --git a/python/sglang/srt/models/deepseek_nextn.py b/python/sglang/srt/models/deepseek_nextn.py
+index c749bac2c2..2e5da85482 100644
+--- a/python/sglang/srt/models/deepseek_nextn.py
++++ b/python/sglang/srt/models/deepseek_nextn.py
+@@ -233,7 +233,15 @@ class DeepseekModelNextN(nn.Module):
+             )
+ 
+             if input_embeds is None:
+-                hidden_states = self.embed_tokens(input_ids)
++                if forward_batch.mm_input_embeds is not None:
++                    # Multimodal draft-extend: the image positions hold padded
++                    # hash ids that must never be embedded. Use the target's
++                    # pre-computed embeddings (vision features at image
++                    # positions); _draft_extend_for_prefill shifts them to match
++                    # the rotated draft-extend input_ids.
++                    hidden_states = forward_batch.mm_input_embeds
++                else:
++                    hidden_states = self.embed_tokens(input_ids)
+             else:
+                 hidden_states = input_embeds
+ 
+diff --git a/python/sglang/srt/models/glm5_next.py b/python/sglang/srt/models/glm5_next.py
+index a2ef6bbf10..c65ddd02c1 100644
+--- a/python/sglang/srt/models/glm5_next.py
++++ b/python/sglang/srt/models/glm5_next.py
+@@ -8,6 +8,7 @@ from torch import nn
+ from torch.nn import functional as F
+ 
+ from sglang.kernels.ops.attention.fla.fused_norm_gate import FusedRMSNormGated
++from sglang.kernels.ops.layernorm.mhc import hc_contract
+ from sglang.kernels.ops.layernorm.mhc import hc_post as _hc_post_fn
+ from sglang.kernels.ops.layernorm.mhc import hc_pre as _hc_pre_fn
+ from sglang.srt.batch_overlap.two_batch_overlap import (
+@@ -59,7 +60,10 @@ from sglang.srt.layers.linear import (
+ )
+ from sglang.srt.layers.logits_processor import LogitsProcessor
+ from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+-from sglang.srt.layers.moe.utils import get_moe_a2a_backend
++from sglang.srt.layers.moe.utils import (
++    get_moe_a2a_backend,
++    is_shared_experts_fusion_disabled,
++)
+ from sglang.srt.layers.quantization.base_config import QuantizationConfig
+ from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
+ from sglang.srt.layers.rotary_embedding import get_rope
+@@ -959,6 +963,7 @@ class Glm5NextModel(nn.Module):
+         prefix: str = "",
+     ) -> None:
+         super().__init__()
++        self.config = config
+         self.padding_id = config.pad_token_id
+         self.vocab_size = config.vocab_size
+         self.first_k_dense_replace = config.first_k_dense_replace
+@@ -1064,6 +1069,7 @@ class Glm5NextModel(nn.Module):
+                 )
+             )
+         self.layers_to_capture = []
++        self.dflash_capture = False
+         if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake():
+             self.enable_a2a_moe = True
+         else:
+@@ -1072,6 +1078,19 @@ class Glm5NextModel(nn.Module):
+     def get_input_embeddings(self) -> torch.Tensor:
+         return self.embed_tokens
+ 
++    def _prepare_aux_hidden_state(
++        self, hidden_states: torch.Tensor, residual: Optional[torch.Tensor]
++    ) -> torch.Tensor:
++        # Under mHC the residual is folded into the widened hidden state, so the
++        # layer communicator hands back residual=None and hc_contract below does
++        # the merge. Only the plain residual-stream path has a tensor to add.
++        aux_hidden_state = (
++            hidden_states if residual is None else hidden_states + residual
++        )
++        if self.dflash_capture and self.config.mhc:
++            aux_hidden_state = hc_contract(aux_hidden_state, self.config.hc_mult)
++        return aux_hidden_state
++
+     def forward(
+         self,
+         input_ids: torch.Tensor,
+@@ -1122,7 +1141,7 @@ class Glm5NextModel(nn.Module):
+ 
+         normal_start_layer = self.start_layer
+         normal_end_layer = self.end_layer
+-        if forward_batch.can_run_tbo:
++        if forward_batch.can_run_tbo and not self.dflash_capture:
+             if (
+                 self.first_k_dense_replace > normal_start_layer
+                 and self.first_k_dense_replace < normal_end_layer
+@@ -1141,13 +1160,14 @@ class Glm5NextModel(nn.Module):
+             )
+             with ctx:
+                 if i in self.layers_to_capture:
++                    aux_hidden_state = self._prepare_aux_hidden_state(
++                        hidden_states, residual
++                    )
+                     if self.enable_a2a_moe and i > self.first_k_dense_replace:
+                         aux_hidden_state = get_parallel().attn_tp_group.all_gather(
+-                            hidden_states + residual, dim=0
++                            aux_hidden_state, dim=0
+                         )
+-                        aux_hidden_states.append(aux_hidden_state)
+-                    else:
+-                        aux_hidden_states.append(hidden_states + residual)
++                    aux_hidden_states.append(aux_hidden_state)
+                 layer = self.layers[i]
+                 hidden_states, residual, topk_indices = layer(
+                     positions,
+@@ -1331,40 +1351,38 @@ class Glm5NextForConditionalGeneration(nn.Module):
+     def end_layer(self):
+         return self.model.end_layer
+ 
+-    def determine_num_fused_shared_experts(self):
+-        self.num_fused_shared_experts = 0
+-        if get_server_args().disable_shared_experts_fusion:
+-            return
+-
+-        disable_reason = None
+-        if not getattr(self.config, "n_shared_experts", None):
+-            disable_reason = "No shared experts are defined in the config."
+-        elif not _is_cuda:
+-            disable_reason = "Shared experts fusion currently requires CUDA devices."
+-        elif _is_cuda and (_device_sm is not None) and (_device_sm < 80):
+-            disable_reason = "Shared experts fusion requires SM80 or newer GPUs."
+-        elif get_parallel().moe_ep_size > 1:
+-            disable_reason = (
++    @classmethod
++    def shared_experts_fusion_disable_reason(cls, hf_config, quant_config):
++        # Kept in lockstep with the wrapper gate below: a divergence drops the
++        # shared-expert weights and runs the fused slot uninitialized.
++        text_config = getattr(hf_config, "text_config", hf_config)
++        if not getattr(text_config, "n_shared_experts", None):
++            return "No shared experts are defined in the config."
++        if not _is_cuda:
++            return "Shared experts fusion currently requires CUDA devices."
++        if _device_sm is not None and _device_sm < 80:
++            return "Shared experts fusion requires SM80 or newer GPUs."
++        if get_parallel().moe_ep_size > 1:
++            return (
+                 "Shared experts fusion is not supported together with expert "
+                 "parallelism yet."
+             )
+-        elif get_moe_a2a_backend().is_deepep():
+-            disable_reason = (
++        if get_moe_a2a_backend().is_deepep():
++            return (
+                 "Shared experts fusion is not supported when Deepep MoE backend "
+                 "is enabled."
+             )
++        return None
+ 
+-        if disable_reason is not None:
+-            log_info_on_rank0(
+-                logger,
+-                f"{disable_reason} Shared experts fusion optimization is disabled.",
+-            )
++    def determine_num_fused_shared_experts(self):
++        self.num_fused_shared_experts = (
++            0 if is_shared_experts_fusion_disabled() else self.config.n_shared_experts
++        )
++        if self.num_fused_shared_experts == 0:
+             return
+-
+-        self.num_fused_shared_experts = self.config.n_shared_experts
+-        assert (
+-            self.num_fused_shared_experts == 1
+-        ), f"Only 1 fused shared expert is supported for {type(self).__name__}"
++        assert self.num_fused_shared_experts == 1, (
++            f"Only 1 fused shared expert is supported for {type(self).__name__}"
++        )
+         log_info_on_rank0(logger, "Shared experts fusion optimization enabled.")
+ 
+     def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
+@@ -1379,6 +1397,20 @@ class Glm5NextForConditionalGeneration(nn.Module):
+             self.capture_aux_hidden_states = True
+             self.model.layers_to_capture = [val + 1 for val in layer_ids]
+ 
++    def set_dflash_layers_to_capture(self, layer_ids: List[int]):
++        if not self.pp_group.is_last_rank:
++            return
++
++        if layer_ids is None:
++            raise ValueError(
++                "DFLASH requires explicit layer_ids for aux hidden capture."
++            )
++
++        self.capture_aux_hidden_states = True
++        self.model.dflash_capture = True
++        # Capturing before layer k + 1 gives the completed output of layer k.
++        self.model.layers_to_capture = [val + 1 for val in layer_ids]
++
+     def prepare_context_parallel_metadata_for_dcp(
+         self,
+         seq_lens: torch.Tensor,
+diff --git a/python/sglang/srt/multimodal/processors/glm4v.py b/python/sglang/srt/multimodal/processors/glm4v.py
+index 7aeafc9cf5..1e2154adc9 100644
+--- a/python/sglang/srt/multimodal/processors/glm4v.py
++++ b/python/sglang/srt/multimodal/processors/glm4v.py
+@@ -5,6 +5,7 @@ from typing import List, Union
+ 
+ import numpy as np
+ import torch
++from transformers.image_utils import OPENAI_CLIP_MEAN, OPENAI_CLIP_STD
+ 
+ from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
+ from sglang.srt.managers.schedule_batch import MultimodalProcessorOutput
+@@ -29,6 +30,13 @@ try:
+ except ImportError:
+     Glm5NextForConditionalGeneration = None
+ 
++try:
++    from sglang.srt.models.glm5_next_nextn import (
++        Glm5NextForConditionalGenerationNextN,
++    )
++except ImportError:
++    Glm5NextForConditionalGenerationNextN = None
++
+ GLM_VIDEO_DEFAULT_FPS = 2.0
+ GLM_VIDEO_DEFAULT_MAX_FRAMES = 2048
+ GLM_VIDEO_PATCH_SIZE = 14
+@@ -433,7 +441,6 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
+         for m in [
+             Glm4vForConditionalGeneration,
+             Glm4vMoeForConditionalGeneration,
+-            Glm5NextForConditionalGeneration,
+             GlmOcrForConditionalGeneration,
+         ]
+         if m is not None
+@@ -602,3 +609,251 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
+             mrope_positions=mrope_positions,
+             mrope_position_delta=mrope_position_delta,
+         )
++
++
++def _glm5next_smart_resize_canvas(
++    height, width, *, temporal_factor, factor, min_pixels, max_pixels
++):
++    """GLM5Next smart_resize replica (HF Glm5NextImageProcessor).
++
++    ``min_pixels``/``max_pixels`` are the token budgets (min/max_image_tokens);
++    they are scaled by the per-token pixel count inside, matching the HF
++    implementation.
++    """
++
++    def align(value):
++        return math.ceil(value / factor) * factor
++
++    pixels_per_token = temporal_factor * factor**2
++    min_pixels *= pixels_per_token
++    max_pixels *= pixels_per_token
++
++    def fit_within_budget(aligned_frames):
++        low, high = 1, height
++        best_height, best_width = factor, factor
++        while low <= high:
++            content_height = (low + high) // 2
++            content_width = max(1, math.floor(width * content_height / height))
++            candidate_height = align(content_height)
++            candidate_width = align(content_width)
++            if aligned_frames * candidate_height * candidate_width <= max_pixels:
++                best_height, best_width = candidate_height, candidate_width
++                low = content_height + 1
++            else:
++                high = content_height - 1
++        return best_height, best_width
++
++    aligned_frames = max(
++        temporal_factor, round(1 / temporal_factor) * temporal_factor
++    )
++    aligned_height = align(height)
++    aligned_width = align(width)
++    aligned_budget = aligned_frames * aligned_height * aligned_width
++
++    # Scale up tiny images to reach the minimum token budget.
++    if aligned_budget < min_pixels:
++        scale = math.sqrt(min_pixels / (height * width))
++        aligned_height = align(max(1, math.ceil(height * scale)))
++        aligned_width = align(max(1, math.ceil(width * scale)))
++        aligned_budget = aligned_frames * aligned_height * aligned_width
++
++    # Shrink oversized images into the maximum token budget.
++    if aligned_budget > max_pixels:
++        aligned_height, aligned_width = fit_within_budget(aligned_frames)
++
++    return aligned_height, aligned_width
++
++
++class Glm5NextImageProcessor(Glm4vImageProcessor):
++    """Native GLM5Next image preprocessing.
++
++    transformers has no Glm5NextImageProcessor, so AutoProcessor resolves to a
++    plain tokenizer that silently drops ``images=`` kwargs. Preprocess images
++    here (replicating the HF Glm5NextImageProcessor: smart_resize canvas,
++    CLIP normalize, merge-aware patchify) and expand the single <|image|>
++    placeholder token emitted by the chat template into the number of vision
++    tower features, so the encoder output is not truncated by
++    ``_adjust_embedding_length``.
++    """
++
++    models = [
++        m
++        for m in [
++            Glm5NextForConditionalGeneration,
++            Glm5NextForConditionalGenerationNextN,
++        ]
++        if m is not None
++    ]
++
++    def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
++        super().__init__(hf_config, server_args, _processor, *args, **kwargs)
++
++        vc = getattr(hf_config, "vision_config", None)
++        self.patch_size = getattr(vc, "patch_size", 14)
++        self.temporal_patch_size = getattr(vc, "temporal_patch_size", 2)
++        self.merge_size = getattr(vc, "spatial_merge_size", 2)
++        self.image_mean = list(getattr(vc, "image_mean", None) or OPENAI_CLIP_MEAN)
++        self.image_std = list(getattr(vc, "image_std", None) or OPENAI_CLIP_STD)
++
++        # Token budgets come from the checkpoint's processor config, defaulting
++        # to the HF Glm5NextImageProcessor values.
++        self.min_image_tokens = 16
++        self.max_image_tokens = 8000
++        try:
++            import os
++
++            proc_cfg_path = os.path.join(server_args.model_path, "processor_config.json")
++            with open(proc_cfg_path) as f:
++                iproc_cfg = json.load(f).get("image_processor", {})
++            if iproc_cfg.get("image_mean") is not None:
++                self.image_mean = list(iproc_cfg["image_mean"])
++            if iproc_cfg.get("image_std") is not None:
++                self.image_std = list(iproc_cfg["image_std"])
++            if iproc_cfg.get("min_image_tokens") is not None:
++                self.min_image_tokens = int(iproc_cfg["min_image_tokens"])
++            if iproc_cfg.get("max_image_tokens") is not None:
++                self.max_image_tokens = int(iproc_cfg["max_image_tokens"])
++        except (FileNotFoundError, OSError, ValueError, json.JSONDecodeError):
++            pass
++
++    def _preprocess_image(self, pil_image):
++        """Return (pixel_values (num_patches, C*T*P*P), [1, grid_h, grid_w])."""
++        from torchvision.transforms.v2 import functional as tvF
++
++        # GPU (nvJPEG) decode returns a CUDA tensor for strict JPEGs while every
++        # other encoding falls back to a CPU PIL image. Keep this native
++        # preprocessing CPU-uniform so a request mixing both decode paths never
++        # concatenates CUDA and CPU pixel blocks.
++        if isinstance(pil_image, torch.Tensor):
++            pil_image = (
++                pil_image.detach().to("cpu") if pil_image.is_cuda else pil_image
++            )
++
++        pixels_per_token = self.temporal_patch_size * self.patch_size**2
++        factor = self.patch_size * self.merge_size
++        min_pixels = self.min_image_tokens * pixels_per_token
++        max_pixels = self.max_image_tokens * pixels_per_token
++
++        img = tvF.to_image(pil_image)
++        img = img.to(torch.float32) / 255.0
++        height, width = img.shape[-2:]
++
++        target_h, target_w = _glm5next_smart_resize_canvas(
++            height,
++            width,
++            temporal_factor=self.temporal_patch_size,
++            factor=factor,
++            min_pixels=self.min_image_tokens,
++            max_pixels=self.max_image_tokens,
++        )
++        scale = min(target_h / height, target_w / width)
++        if self.temporal_patch_size * height * width >= pixels_per_token * self.min_image_tokens:
++            scale = min(1.0, scale)
++        content_h = max(1, min(target_h, math.floor(height * scale)))
++        content_w = max(1, min(target_w, math.floor(width * scale)))
++        if (content_h, content_w) != (height, width):
++            img = tvF.resize(
++                img,
++                [content_h, content_w],
++                interpolation=tvF.InterpolationMode.BICUBIC,
++                antialias=True,
++            )
++        img = tvF.pad(
++            img, [0, 0, target_w - content_w, target_h - content_h], fill=0.0
++        )
++
++        mean = torch.tensor(
++            self.image_mean, dtype=img.dtype, device=img.device
++        ).view(-1, 1, 1)
++        std = torch.tensor(
++            self.image_std, dtype=img.dtype, device=img.device
++        ).view(-1, 1, 1)
++        img = (img - mean) / std
++
++        # Merge-aware patchify, matching the HF layout exactly: each output row
++        # is one (merge, merge) block flattened as (C, T, P, P) -- channel
++        # outermost, then temporal, then spatial -- which is the layout the
++        # Conv3d patch embed expects.
++        channel, gh, gw = img.shape[0], img.shape[1] // self.patch_size, img.shape[2] // self.patch_size
++        m = self.merge_size
++        patches = img.unsqueeze(0).reshape(
++            1,
++            channel,
++            gh // m,
++            m,
++            self.patch_size,
++            gw // m,
++            m,
++            self.patch_size,
++        )
++        patches = patches.permute(0, 2, 5, 3, 6, 1, 4, 7)  # (1, gh', gw', m, m, C, P, P)
++        patches = patches.unsqueeze(6).expand(
++            -1, -1, -1, -1, -1, -1, self.temporal_patch_size, -1, -1
++        )  # (1, gh', gw', m, m, C, T, P, P)
++        flatten = patches.reshape(
++            1, gh * gw, channel * self.temporal_patch_size * self.patch_size * self.patch_size
++        )[0]
++        return flatten, [1, gh, gw]
++
++    def _expand_image_tokens(self, input_ids, counts):
++        """Replace each <|image|> placeholder with ``counts[i]`` copies."""
++        image_token_id = self.mm_tokens.image_token_id
++        if image_token_id is None:
++            raise ValueError("image placeholder token id is not set for this processor")
++
++        mask = input_ids == image_token_id
++        num_placeholders = int(mask.sum().item())
++        if num_placeholders != len(counts):
++            raise ValueError(
++                f"prompt has {num_placeholders} image placeholder token(s) but "
++                f"{len(counts)} image(s) were provided"
++            )
++
++        expanded = []
++        next_image_idx = 0
++        for token_id in input_ids.tolist():
++            if token_id == image_token_id:
++                expanded.extend([image_token_id] * counts[next_image_idx])
++                next_image_idx += 1
++            else:
++                expanded.append(token_id)
++        return torch.tensor(expanded, dtype=input_ids.dtype)
++
++    def process_mm_data(
++        self, input_text, images=None, videos=None, audios=None, **kwargs
++    ):
++        if not images or videos or audios:
++            return super().process_mm_data(
++                input_text, images=images, videos=videos, audios=audios, **kwargs
++            )
++
++        tokenize_kwargs = {}
++        bos = getattr(self._tokenizer, "bos_token", None)
++        if (
++            bos
++            and self._tokenizer_auto_adds_specials
++            and isinstance(input_text, str)
++            and input_text.startswith(bos)
++        ):
++            tokenize_kwargs["add_special_tokens"] = False
++        input_ids = self._tokenizer(
++            input_text, return_tensors="pt", **tokenize_kwargs
++        ).input_ids.flatten()
++
++        pixel_values = []
++        grids = []
++        counts = []
++        for pil_image in images:
++            pv, grid = self._preprocess_image(pil_image)
++            pixel_values.append(pv)
++            grids.append(grid)
++            counts.append(grid[1] * grid[2] // (self.merge_size**2))
++
++        input_ids = self._expand_image_tokens(input_ids, counts)
++
++        return {
++            "input_ids": input_ids,
++            "attention_mask": torch.ones_like(input_ids),
++            "pixel_values": torch.cat(pixel_values, dim=0),
++            "image_grid_thw": torch.tensor(grids, dtype=torch.long),
++        }
+diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
+index 589f74ce13..1b69044406 100644
+--- a/python/sglang/srt/server_args.py
++++ b/python/sglang/srt/server_args.py
+@@ -5782,6 +5782,11 @@ class ServerArgs:
+             "LongcatFlashForCausalLM",
+             "Dots3NoteForCausalLM",
+         ]:
++            if is_sm120_supported():
++                # SM120 lacks tcgen05/TMEM, so DeepGEMM is unavailable. The MHC
++                # pre-norm must fall back to the TileLang path (DeepseekV4
++                # already mirrors this in its own branch below).
++                envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
+             # Set attention backend for DeepSeek
+             if is_deepseek_dsa(hf_config):  # DeepSeek 3.2/GLM 5
+                 if envs.SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.is_set():
+diff --git a/python/sglang/srt/speculative/eagle_worker_v2.py b/python/sglang/srt/speculative/eagle_worker_v2.py
+index 197bf8c2c3..46612b2bd1 100644
+--- a/python/sglang/srt/speculative/eagle_worker_v2.py
++++ b/python/sglang/srt/speculative/eagle_worker_v2.py
+@@ -864,6 +864,29 @@ class EagleDraftWorker(EagleDraftWorkerBase):
+             assert pt == batch.input_ids.numel()
+             batch.input_ids = new_input_ids
+ 
++            if mm_input_embeds is not None:
++                # Rotate the target's pre-computed embeddings to stay aligned
++                # with the shifted input_ids: drop the first row and append the
++                # tail-token embedding, so the MTP head (which consumes these
++                # via forward_batch.mm_input_embeds) never embeds the padded
++                # hash ids at image positions.
++                embed_tokens = self.draft_runner.model.get_input_embeddings()
++                tail_embeds = embed_tokens(tail_tokens)
++                shifted_mm = torch.empty_like(mm_input_embeds)
++                pt = 0
++                for i, extend_len in enumerate(batch.extend_lens):
++                    shifted_mm[pt : pt + extend_len].copy_(
++                        torch.cat(
++                            (
++                                mm_input_embeds[pt + 1 : pt + extend_len],
++                                tail_embeds[i].unsqueeze(0),
++                            )
++                        )
++                    )
++                    pt += extend_len
++                assert pt == mm_input_embeds.shape[0]
++                mm_input_embeds = shifted_mm
++
+         # Draft-extend spec_info for the extend forward; carries only
+         # hidden_states + shape info.
+         batch.spec_info = EagleDraftExtendInput(
+diff --git a/test/manual/test_hybrid_dsa_hicache_gpu.py b/test/manual/test_hybrid_dsa_hicache_gpu.py
+new file mode 100644
+index 0000000000..3186d73ebd
+--- /dev/null
++++ b/test/manual/test_hybrid_dsa_hicache_gpu.py
+@@ -0,0 +1,265 @@
++#!/usr/bin/env python3
++"""Exact-image GPU byte oracle. Run only in an isolated qualification Job.
++
++Exercises the real index sidecar builder and unmodified CPU/GPU copy paths,
++including noncontiguous physical pages, incremental backup, draft layers,
++and restoration onto different physical pages after poisoning device memory.
++"""
++
++import json
++from types import SimpleNamespace
++from unittest.mock import MagicMock, patch
++
++import torch
++
++from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
++from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
++    HybridCacheController,
++)
++from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
++    _build_hybrid_dsa_index_entry,
++    build_hybrid_mamba_stack,
++)
++from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
++from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
++
++
++def check_derived_slot_lifecycle():
++    """The INDEXER borrows KV addresses; it must never allocate/free its own."""
++    pools = {
++        name: MagicMock() for name in (PoolName.KV, PoolName.MAMBA, PoolName.INDEXER)
++    }
++    group = HostPoolGroup(
++        [
++            PoolEntry(
++                name=name,
++                host_pool=pool,
++                device_pool=None,
++                layer_mapper=lambda layer: layer,
++                is_primary_index_anchor=name == PoolName.KV,
++            )
++            for name, pool in pools.items()
++        ]
++    )
++    controller = object.__new__(HybridCacheController)
++    controller.mem_pool_host = group
++    controller.write_queue = []
++    controller.start_writing = MagicMock()
++    for iteration in range(100):
++        # Reuse a bounded host range after each prior operation was released.
++        size = 512 if iteration % 2 == 0 else 256
++        host = torch.arange(size, dtype=torch.int64)
++        device = host + 1024
++        pools[PoolName.KV].alloc.return_value = host
++        pools[PoolName.MAMBA].alloc.return_value = torch.tensor([iteration % 4])
++        pools[PoolName.MAMBA].free.return_value = 1
++        result = controller.write(
++            device,
++            node_id=iteration,
++            extra_pools=[
++                PoolTransfer(PoolName.INDEXER, indices_from_pool=PoolName.KV),
++                PoolTransfer(PoolName.MAMBA, device_indices=torch.tensor([3])),
++            ],
++        )
++        assert result is host
++        operation = controller.write_queue.pop()
++        derived = next(
++            t for t in operation.pool_transfers if t.name == PoolName.INDEXER
++        )
++        assert derived.host_indices is host
++        assert derived.device_indices is device
++        assert group.release_transfers(operation.pool_transfers) == 1
++        # A published node may split only at a whole compression group.
++        for child in host.split(256):
++            group.free(child)
++    pools[PoolName.INDEXER].alloc.assert_not_called()
++    pools[PoolName.INDEXER].free.assert_not_called()
++    assert pools[PoolName.MAMBA].free.call_count == 100
++    assert pools[PoolName.KV].free.call_count == 150
++    print("Derived INDEXER controller lifecycle: 100/100 passed", flush=True)
++
++
++def check_ratio_mode():
++    prefix = "sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler."
++    target = make_pool((True, True))
++    target.kv_cache_dim = 656
++    memory = SimpleNamespace(
++        hicache_size=0,
++        hicache_ratio=2.5,
++        hicache_mem_layout="page_first",
++        hicache_write_policy="write_through",
++        hicache_io_backend="kernel",
++        hicache_host_memory_mode=None,
++    )
++    params = SimpleNamespace(
++        page_size=64,
++        mtp_draft_device_pools=(),
++        req_to_token_pool=SimpleNamespace(mamba_allocator=MagicMock()),
++        token_to_kv_pool_allocator=MagicMock(),
++        tp_cache_group=None,
++        attn_cp_cache_group=None,
++        attn_tp_cache_group=None,
++        pp_cache_group=None,
++    )
++    with (
++        patch(prefix + "get_memory", return_value=memory),
++        patch(prefix + "_get_allocator_type", return_value="default"),
++        patch(prefix + "_split_hicache_size") as split,
++        patch(prefix + "build_kv_host_pool") as build_kv,
++        patch(prefix + "MambaPoolHost"),
++        patch(prefix + "DeepSeekV4PagedHostPool") as index_host,
++        patch(prefix + "HybridCacheController"),
++    ):
++        build_kv.return_value.page_num = 20
++        group, _ = build_hybrid_mamba_stack(
++            params=params,
++            server_args=SimpleNamespace(hicache_host_memory_mode=None),
++            kv_pool=target,
++            mamba_pool=MagicMock(),
++            full_layer_mapping={0: 0, 3: 1},
++            mamba_layer_mapping={1: 0, 2: 1},
++            load_cache_event=None,
++            storage_backend=None,
++            use_mla=True,
++        )
++        split.assert_not_called()
++        assert build_kv.call_args.kwargs["host_size"] is None
++        assert index_host.call_args.kwargs["num_host_pages"] == 20
++        assert PoolName.INDEXER in group.entry_map
++    print("Hybrid DSA ratio-mode assembly: passed", flush=True)
++
++
++def make_pool(live_layers):
++    pool = object.__new__(DSATokenToKVPool)
++    pool.page_size = 64
++    pool.index_kpool = 4
++    pool.kpool_use_compress = True
++    pool.layer_num = len(live_layers)
++    pool.index_key_cache = SimpleNamespace(
++        buffer=[
++            torch.zeros((8 if live else 0, 64 * 132), dtype=torch.uint8, device="cuda")
++            for live in live_layers
++        ]
++    )
++    return pool
++
++
++def tokens(pages):
++    return (pages[:, None] * 64 + torch.arange(64, device=pages.device)).flatten()
++
++
++def run_case(layout, backend, trial):
++    target = make_pool((True, False, True))
++    draft = make_pool((True,))
++    prefix = "sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler."
++    with (
++        patch(
++            prefix + "get_memory",
++            return_value=SimpleNamespace(hicache_mem_layout=layout),
++        ),
++        patch(prefix + "_get_allocator_type", return_value="default"),
++    ):
++        entry = _build_hybrid_dsa_index_entry(
++            kv_pool=target,
++            kv_host_pool=SimpleNamespace(page_num=16),
++            layer_mapping={0: 0, 4: 1, 8: 2, 45: 3},
++            transfer_layer_num=46,
++            draft_pools=(draft,),
++        )
++    assert entry.layer_mapper(4) is None
++    assert entry.layer_mapper(45) == 2
++    host = entry.host_pool
++    assert len(host.device_buffers) == 3
++    assert host.item_bytes == 8448
++    generator = torch.Generator(device="cpu").manual_seed(37625 + trial)
++    originals = []
++    for buffer in host.device_buffers:
++        original = torch.randint(
++            0, 256, buffer.shape, dtype=torch.uint8, generator=generator
++        )
++        buffer.copy_(original)
++        originals.append(original)
++    source_pages = torch.randperm(8, generator=generator)
++    host_pages = torch.randperm(16, generator=generator)[:8]
++    dest_pages = torch.randperm(8, generator=generator)
++    index_device = "cuda" if backend == "kernel" else "cpu"
++    src = tokens(source_pages.to(index_device))
++    dst = tokens(dest_pages.to(index_device))
++    cached = tokens(host_pages.to(index_device))
++    # The staged page-first D2H path consumes CPU destination indices,
++    # exactly as HybridCacheController._move_write_operation supplies them.
++    backup_cached = cached.cpu() if host.can_use_write_back_jit else cached
++    # Explicit dependencies model asynchronous transfers without relying on
++    # the default stream's implicit ordering.
++    backup_stream = torch.cuda.Stream()
++    restore_stream = torch.cuda.Stream()
++    backup_stream.wait_stream(torch.cuda.current_stream())
++    with torch.cuda.stream(backup_stream):
++        for start in (0, 256):
++            host.backup_from_device_all_layer(
++                target,
++                backup_cached[start : start + 256],
++                src[start : start + 256],
++                backend,
++            )
++        backed_up = backup_stream.record_event()
++    torch.cuda.current_stream().wait_event(backed_up)
++    for buffer in host.device_buffers:
++        buffer.fill_(173)
++    restore_stream.wait_stream(torch.cuda.current_stream())
++    with torch.cuda.stream(restore_stream):
++        for layer in range(3):
++            host.load_to_device_per_layer(target, cached, dst, layer, backend)
++        restored = restore_stream.record_event()
++    restored.synchronize()
++    for layer, buffer in enumerate(host.device_buffers):
++        actual = buffer.cpu()[dest_pages]
++        expected = originals[layer][source_pages]
++        assert torch.equal(actual, expected), (layout, backend, trial, layer)
++    # Repeated pools in one process must release their cudaHostRegister ranges
++    # before the next build; without this the allocator reuses still-mapped
++    # virtual addresses and cudaHostRegister fails with rc=712.
++    host.destroy()
++    print(
++        json.dumps(
++            {
++                "layout": layout,
++                "backend": backend,
++                "trial": trial,
++                "layers": 3,
++                "pages": 8,
++                "bytes_compared": 3 * 8 * 8448,
++                "passed": True,
++            }
++        ),
++        flush=True,
++    )
++
++
++def main():
++    assert torch.cuda.is_available(), "requires an isolated CUDA Job"
++    print(
++        json.dumps(
++            {
++                "gpu": torch.cuda.get_device_name(),
++                "capability": torch.cuda.get_device_capability(),
++            }
++        ),
++        flush=True,
++    )
++    with torch.inference_mode():
++        check_derived_slot_lifecycle()
++        check_ratio_mode()
++        for layout, backend in (
++            ("page_first", "kernel"),
++            ("layer_first", "kernel"),
++            ("layer_first", "direct"),
++            ("page_first_direct", "direct"),
++        ):
++            for trial in range(5):
++                run_case(layout, backend, trial)
++    print("Hybrid DSA HiCache GPU byte oracle: 20/20 passed", flush=True)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/test/registered/unit/mem_cache/test_hisparse_dsa_pool_kpool_args.py b/test/registered/unit/mem_cache/test_hisparse_dsa_pool_kpool_args.py
+new file mode 100644
+index 0000000000..acd87bda3d
+--- /dev/null
++++ b/test/registered/unit/mem_cache/test_hisparse_dsa_pool_kpool_args.py
+@@ -0,0 +1,89 @@
++"""Unit tests for HiSparse DSA pool kpool-compression argument passthrough."""
++
++import unittest
++from unittest.mock import patch
++
++import torch
++
++from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
++from sglang.test.ci.ci_register import register_cpu_ci
++from sglang.test.test_utils import CustomTestCase
++
++register_cpu_ci(est_time=2, suite="base-a-test-cpu")
++
++
++class TestHiSparseDSAKpoolArgs(CustomTestCase):
++    def test_constructor_forwards_kpool_compression_args(self):
++        """HiSparse DSA pools must accept and forward the kpool-compression
++        knobs the kv-cache configurator always supplies for DSA models, so
++        ``--enable-hisparse`` plus a DSA/GLM-5.x model cannot hit a TypeError
++        and HiSparse pools can participate in kpool compression and
++        index-layer elision."""
++        seen = {}
++
++        def fake_init(self, **kwargs):
++            seen.update(kwargs)
++            self.kv_cache_dim = kwargs["kv_cache_dim"]
++            self.dtype = kwargs["dtype"]
++
++        with patch(
++            "sglang.srt.mem_cache.hisparse_memory_pool.DSATokenToKVPool.__init__",
++            fake_init,
++        ):
++            HiSparseDSATokenToKVPool(
++                size=1024,
++                page_size=64,
++                kv_lora_rank=512,
++                dtype=torch.uint8,
++                qk_rope_head_dim=64,
++                layer_num=2,
++                device="cpu",
++                index_head_dim=128,
++                enable_memory_saver=False,
++                kv_cache_dim=640,
++                index_kpool=4,
++                index_kpool_compress=True,
++                tail_extra_slots=8,
++                max_running_requests=4,
++                skip_topk_layers=[False, True],
++            )
++        self.assertEqual(seen["index_kpool"], 4)
++        self.assertTrue(seen["index_kpool_compress"])
++        self.assertEqual(seen["tail_extra_slots"], 8)
++        self.assertEqual(seen["max_running_requests"], 4)
++        self.assertEqual(seen["skip_topk_layers"], [False, True])
++        self.assertEqual(seen["index_buf_size"], 1024 * 2)
++
++    def test_defaults_when_omitted(self):
++        seen = {}
++
++        def fake_init(self, **kwargs):
++            seen.update(kwargs)
++            self.kv_cache_dim = kwargs["kv_cache_dim"]
++            self.dtype = kwargs["dtype"]
++
++        with patch(
++            "sglang.srt.mem_cache.hisparse_memory_pool.DSATokenToKVPool.__init__",
++            fake_init,
++        ):
++            HiSparseDSATokenToKVPool(
++                size=1024,
++                page_size=64,
++                kv_lora_rank=512,
++                dtype=torch.uint8,
++                qk_rope_head_dim=64,
++                layer_num=2,
++                device="cpu",
++                index_head_dim=128,
++                enable_memory_saver=False,
++                kv_cache_dim=640,
++            )
++        self.assertEqual(seen["index_kpool"], 1)
++        self.assertFalse(seen["index_kpool_compress"])
++        self.assertEqual(seen["tail_extra_slots"], 0)
++        self.assertIsNone(seen["max_running_requests"])
++        self.assertIsNone(seen["skip_topk_layers"])
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/test/registered/unit/mem_cache/test_hybrid_dsa_hicache.py b/test/registered/unit/mem_cache/test_hybrid_dsa_hicache.py
+new file mode 100644
+index 0000000000..d09d06d636
+--- /dev/null
++++ b/test/registered/unit/mem_cache/test_hybrid_dsa_hicache.py
+@@ -0,0 +1,387 @@
++"""CPU regressions for hybrid DSA index ownership and HiCache assembly."""
++
++import unittest
++from types import SimpleNamespace
++from unittest.mock import MagicMock, patch
++
++import torch
++
++from sglang.srt.mem_cache.base_prefix_cache import InsertParams, MatchPrefixParams
++from sglang.srt.mem_cache.cache_init_params import CacheInitParams
++from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
++from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
++    HybridCacheController,
++)
++from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
++    _build_hybrid_dsa_index_entry,
++    _MambaStrategy,
++    build_hybrid_mamba_stack,
++    build_pool_entry,
++)
++from sglang.srt.mem_cache.memory_pool import (
++    DSATokenToKVPool,
++    HybridLinearKVPool,
++    HybridReqToTokenPool,
++)
++from sglang.srt.mem_cache.pool_host import HostPoolGroup
++from sglang.srt.mem_cache.radix_cache import RadixKey
++from sglang.srt.mem_cache.unified_cache.components import ComponentType, MambaComponent
++from sglang.srt.mem_cache.unified_radix_cache import (
++    UnifiedRadixCache,
++    _compressed_index_tree_params,
++)
++from sglang.srt.runtime_context import publish, reset_context
++from sglang.srt.server_args import ServerArgs
++from sglang.test.ci.ci_register import register_cpu_ci
++
++register_cpu_ci(est_time=2, suite="base-a-test-cpu")
++
++
++def dsa_pool(*, live_layers=(True, True), compress=True, kpool=4):
++    pool = object.__new__(DSATokenToKVPool)
++    pool.page_size = 64
++    pool.index_kpool = kpool
++    pool.kpool_use_compress = compress
++    pool.layer_num = len(live_layers)
++    pool.index_key_cache = SimpleNamespace(
++        buffer=[
++            torch.zeros((8 if live else 0, 64 * 132), dtype=torch.uint8)
++            for live in live_layers
++        ]
++    )
++    return pool
++
++
++def cache_params(pool, *, page_size=64):
++    hybrid = object.__new__(HybridLinearKVPool)
++    hybrid.full_kv_pool = pool
++    return CacheInitParams(
++        disable=False,
++        req_to_token_pool=SimpleNamespace(),
++        token_to_kv_pool_allocator=SimpleNamespace(
++            get_kvcache=lambda: hybrid,
++            device=torch.device("cpu"),
++            size=2048,
++            free=MagicMock(),
++            free_segment=MagicMock(),
++        ),
++        page_size=page_size,
++        tree_components=(ComponentType.FULL,),
++    )
++
++
++class TestCompressedIndexOwnership(unittest.TestCase):
++    def setUp(self):
++        server_args = ServerArgs(model_path="dummy")
++        server_args._mamba_cache_chunk_size = 64
++        publish(server_args, role="scheduler")
++        self.addCleanup(reset_context)
++
++    def test_tree_alignment_does_not_change_transfer_params(self):
++        params = cache_params(dsa_pool())
++        tree_params = _compressed_index_tree_params(params)
++        self.assertEqual(tree_params.page_size, 256)
++        self.assertEqual(params.page_size, 64)
++        self.assertIs(
++            tree_params.token_to_kv_pool_allocator, params.token_to_kv_pool_allocator
++        )
++        self.assertEqual(
++            _compressed_index_tree_params(
++                cache_params(dsa_pool(), page_size=512)
++            ).page_size,
++            512,
++        )
++
++    def test_uncompressed_hybrid_is_unchanged(self):
++        params = cache_params(dsa_pool(compress=False))
++        self.assertIs(_compressed_index_tree_params(params), params)
++        params = cache_params(SimpleNamespace())
++        self.assertIs(_compressed_index_tree_params(params), params)
++
++    def test_mamba_checkpoint_grid_follows_index_ownership_not_transfer_pages(self):
++        params = cache_params(dsa_pool())
++        params.req_to_token_pool = object.__new__(HybridReqToTokenPool)
++        params.enable_mamba_extra_buffer = True
++        tree_params = _compressed_index_tree_params(params)
++        component = MambaComponent(MagicMock(), tree_params)
++        self.assertEqual(component.mamba_cache_chunk_size, 64)
++        self.assertEqual(component.mamba_checkpoint_grid, 256)
++        self.assertEqual(params.page_size, 64)
++
++    def test_branch_inside_group_cannot_share_first_index_page(self):
++        for common in (64, 128, 192, 320, 384, 448):
++            with self.subTest(common=common):
++                cache = UnifiedRadixCache(cache_params(dsa_pool()))
++                a = [1] * 512
++                cache.insert(InsertParams(key=RadixKey(a), value=torch.arange(64, 576)))
++                b = [1] * common + [2] * (512 - common)
++                match = cache.match_prefix(MatchPrefixParams(key=RadixKey(b)))
++                self.assertEqual(len(match.device_indices), common // 256 * 256)
++                # Neither matching nor inserting the branch may create a node
++                # that divides one compressed index row between two children.
++                cache.insert(
++                    InsertParams(key=RadixKey(b), value=torch.arange(640, 1152))
++                )
++                for node in cache.tree_core._node_arena.values():
++                    self.assertEqual(len(node.key) % 256, 0)
++
++    def test_partial_group_is_not_published_then_extended_in_place(self):
++        cache = UnifiedRadixCache(cache_params(dsa_pool()))
++        for length in (64, 128, 192):
++            key = RadixKey([1] * length)
++            cache.insert(InsertParams(key=key, value=torch.arange(64, 64 + length)))
++            match = cache.match_prefix(MatchPrefixParams(key=key))
++            self.assertEqual(len(match.device_indices), 0)
++        cache.insert(InsertParams(key=RadixKey([1] * 256), value=torch.arange(64, 320)))
++        match = cache.match_prefix(MatchPrefixParams(key=RadixKey([1] * 320)))
++        self.assertEqual(len(match.device_indices), 256)
++
++    def test_runtime_storage_attach_rejects_different_hash_page_size(self):
++        cache = UnifiedRadixCache(cache_params(dsa_pool()))
++        cache.cache_controller = SimpleNamespace(page_size=64)
++        cache._storage_attachment = MagicMock()
++        success, message = cache.attach_storage_backend("file")
++        self.assertFalse(success)
++        self.assertIn("L2 HiCache only", message)
++        cache._storage_attachment.attach.assert_not_called()
++
++    def test_startup_storage_rejects_different_hash_page_size(self):
++        params = cache_params(dsa_pool())
++        cache = UnifiedRadixCache(params)
++        with (
++            patch(
++                "sglang.srt.mem_cache.unified_radix_cache.get_memory",
++                return_value=SimpleNamespace(
++                    hicache_host_memory_mode="cache", hicache_storage_backend="file"
++                ),
++            ),
++            self.assertRaisesRegex(ValueError, "L2 HiCache only"),
++        ):
++            cache.init_hicache(ServerArgs(model_path="dummy"), params)
++
++
++class TestHybridIndexSidecar(unittest.TestCase):
++    def setUp(self):
++        self.prefix = "sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler."
++        self.memory = SimpleNamespace(hicache_mem_layout="layer_first")
++
++    def build_entry(self, pool, *, drafts=(), mapping=None, layer_num=6):
++        if mapping is None:
++            mapping = {0: 0, 3: 1}
++        with (
++            patch(self.prefix + "get_memory", return_value=self.memory),
++            patch(self.prefix + "_get_allocator_type", return_value="default"),
++            patch(self.prefix + "DeepSeekV4PagedHostPool") as host_cls,
++        ):
++            entry = _build_hybrid_dsa_index_entry(
++                kv_pool=pool,
++                kv_host_pool=SimpleNamespace(page_num=16),
++                layer_mapping=mapping,
++                transfer_layer_num=layer_num + len(drafts),
++                draft_pools=drafts,
++            )
++        return entry, host_cls
++
++    def test_non_dsa_has_no_sidecar(self):
++        entry, host_cls = self.build_entry(SimpleNamespace())
++        self.assertIsNone(entry)
++        host_cls.assert_not_called()
++
++    def test_real_stack_registers_indexer_within_fixed_host_budget(self):
++        pool = dsa_pool()
++        draft = dsa_pool(live_layers=(True,))
++        for item in (pool, draft):
++            item.kv_cache_dim = 656
++            item.store_dtype = torch.uint8
++        wrapper = object.__new__(HybridLinearKVPool)
++        wrapper.full_kv_pool = draft
++        params = cache_params(pool)
++        params.req_to_token_pool.mamba_allocator = MagicMock()
++        params.mtp_draft_device_pools = (wrapper,)
++        memory = SimpleNamespace(
++            hicache_size=32,
++            hicache_ratio=2.0,
++            hicache_mem_layout="layer_first",
++            hicache_write_policy="write_through",
++            hicache_io_backend="direct",
++            hicache_host_memory_mode=None,
++        )
++        with (
++            patch(self.prefix + "get_memory", return_value=memory),
++            patch(self.prefix + "_get_allocator_type", return_value="default"),
++            patch(self.prefix + "_split_hicache_size", return_value=(20.0, 12.0)),
++            patch(self.prefix + "build_kv_host_pool") as build_kv,
++            patch(self.prefix + "MambaPoolHost"),
++            patch(self.prefix + "DeepSeekV4PagedHostPool"),
++            patch(self.prefix + "HybridCacheController"),
++        ):
++            build_kv.return_value.page_num = 16
++            group, _ = build_hybrid_mamba_stack(
++                params=params,
++                server_args=MagicMock(),
++                kv_pool=pool,
++                mamba_pool=MagicMock(),
++                full_layer_mapping={0: 0, 3: 1},
++                mamba_layer_mapping={1: 0, 2: 1},
++                load_cache_event=None,
++                storage_backend=None,
++                use_mla=True,
++            )
++        self.assertIn(PoolName.INDEXER, group.entry_map)
++        self.assertEqual(build_kv.call_args.kwargs["page_size"], 64)
++        kv_budget = build_kv.call_args.kwargs["host_size"]
++        self.assertAlmostEqual(kv_budget, 20.0 * 656 / (656 + 132))
++        self.assertAlmostEqual(kv_budget * (1 + 132 / 656), 20.0)
++        self.assertEqual(group.get_entry(PoolName.INDEXER).layer_mapper(4), 2)
++
++    def test_complete_group_roundtrip_with_noncontiguous_pages(self):
++        # Exercise the real host pool and physical-page index conversion. Only
++        # the CUDA copy primitive is replaced by an equivalent CPU byte copy.
++        def allocate(shape, *, dtype, device, **_):
++            return torch.empty(shape, dtype=dtype, device=device)
++
++        def copy_pages(*, src_layers, dst_layers, src_indices, dst_indices, page_size):
++            self.assertEqual(page_size, 1)
++            for src, dst in zip(src_layers, dst_layers, strict=True):
++                dst[dst_indices] = src[src_indices]
++
++        from collections import defaultdict
++
++        from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
++            compute_pooled_write_locs,
++        )
++
++        pool = dsa_pool()
++        draft = dsa_pool(live_layers=(True,))
++        with (
++            patch(self.prefix + "get_memory", return_value=self.memory),
++            patch(self.prefix + "_get_allocator_type", return_value="default"),
++            patch(
++                "sglang.srt.mem_cache.memory_pool_host.ALLOC_MEMORY_FUNCS",
++                defaultdict(lambda: allocate),
++            ),
++        ):
++            entry = _build_hybrid_dsa_index_entry(
++                kv_pool=pool,
++                kv_host_pool=SimpleNamespace(page_num=16),
++                layer_mapping={0: 0, 3: 1, 6: 2},
++                transfer_layer_num=7,
++                draft_pools=(draft,),
++            )
++        host = entry.host_pool
++        originals = []
++        for layer, buffer in enumerate(host.device_buffers):
++            buffer.copy_(torch.arange(buffer.numel()).reshape_as(buffer) + layer)
++            originals.append(buffer.clone())
++        src_pages = torch.tensor([5, 1, 7, 3, 0, 6, 2, 4])
++        host_pages = torch.tensor([9, 4, 13, 1, 8, 14, 3, 7])
++        dst_pages = torch.tensor([2, 6, 4, 0, 7, 3, 5, 1])
++
++        def tokens(pages):
++            return (pages[:, None] * 64 + torch.arange(64)[None, :]).flatten()
++
++        with patch(
++            "sglang.srt.mem_cache.memory_pool_host.transfer_kv_direct",
++            side_effect=copy_pages,
++            create=True,
++        ):
++            # Backup prefix, then its extension without revisiting the prefix.
++            for start in (0, 4):
++                host.backup_from_device_all_layer(
++                    pool,
++                    tokens(host_pages[start : start + 4]),
++                    tokens(src_pages[start : start + 4]),
++                    "direct",
++                )
++            for buffer in host.device_buffers:
++                buffer.fill_(173)
++            for layer in range(len(host.device_buffers)):
++                host.load_to_device_per_layer(
++                    pool, tokens(host_pages), tokens(dst_pages), layer, "direct"
++                )
++                self.assertTrue(
++                    torch.equal(
++                        host.device_buffers[layer][dst_pages],
++                        originals[layer][src_pages],
++                    )
++                )
++            # The pooled-key reader selects each restored group's first page.
++            locs = compute_pooled_write_locs(dst_pages, torch.arange(128), 4)
++            self.assertTrue(torch.equal(locs[:64], 2 * 64 + torch.arange(64)))
++            self.assertTrue(torch.equal(locs[64:], 7 * 64 + torch.arange(64)))
++
++    def test_skipped_target_layers_and_packed_draft_are_layer_mapped(self):
++        pool = dsa_pool(live_layers=(True, False, True))
++        draft = dsa_pool(live_layers=(True,))
++        entry, host_cls = self.build_entry(
++            pool, drafts=(draft,), mapping={0: 0, 2: 1, 4: 2, 6: 3}
++        )
++        buffers = host_cls.call_args.kwargs["device_buffers"]
++        self.assertEqual(len(buffers), 3)
++        self.assertIs(buffers[0], pool.index_k_with_scale_buffer[0])
++        self.assertIs(buffers[1], pool.index_k_with_scale_buffer[2])
++        self.assertIs(buffers[2], draft.index_k_with_scale_buffer[0])
++        self.assertEqual(entry.layer_mapper(0), 0)
++        self.assertIsNone(entry.layer_mapper(2))
++        self.assertEqual(entry.layer_mapper(4), 1)
++        self.assertEqual(entry.layer_mapper(6), 2)
++        self.assertEqual(host_cls.call_args.kwargs["slot_page_size"], 64)
++        self.assertTrue(host_cls.call_args.kwargs["page_aligned_only"])
++
++        # Exercise the actual load-transfer builder: the draft's index must
++        # restore on its first transfer layer, not the target's last layer.
++        anchor = build_pool_entry(
++            name=PoolName.KV,
++            host_pool=MagicMock(layout="layer_first"),
++            device_pool=pool,
++            layer_mapping={0: 0},
++            transfer_layer_num=6,
++            is_anchor=True,
++        )
++        controller = object.__new__(HybridCacheController)
++        controller.mem_pool_host = HostPoolGroup([anchor, entry])
++        controller.layer_num = 6
++        indices = torch.arange(64)
++        transfers = controller._l2_load_transfers(
++            indices,
++            indices,
++            [
++                PoolTransfer(
++                    PoolName.INDEXER, host_indices=indices, device_indices=indices
++                )
++            ],
++        )
++        draft_transfers = [t for t in transfers if t.is_draft]
++        self.assertEqual(len(draft_transfers), 1)
++        self.assertEqual(draft_transfers[0].layer_mapper(0), 2)
++        self.assertIsNone(draft_transfers[0].layer_mapper(1))
++
++    def test_strategy_registers_the_index_transfer_spec(self):
++        pool = dsa_pool()
++        entry, _ = self.build_entry(pool)
++        group = MagicMock()
++        group.entry_map = {PoolName.INDEXER: entry}
++        params = MagicMock()
++        params.req_to_token_pool.mamba_map = {1: 0, 2: 1}
++        kvcache = SimpleNamespace(
++            full_attention_layer_id_mapping={0: 0, 3: 1},
++            full_kv_pool=pool,
++            use_mla=True,
++        )
++        with patch(
++            self.prefix + "build_hybrid_mamba_stack", return_value=(group, MagicMock())
++        ):
++            result = _MambaStrategy().build(
++                cache=MagicMock(),
++                kvcache=kvcache,
++                params=params,
++                server_args=MagicMock(),
++                load_cache_event=None,
++            )
++        self.assertEqual(len(result.sidecars), 1)
++        self.assertEqual(result.sidecars[0].pool_name, PoolName.INDEXER)
++        self.assertEqual(result.sidecars[0].indices_from_pool, PoolName.KV)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/test/registered/unit/mem_cache/test_hybrid_pool_assembler.py b/test/registered/unit/mem_cache/test_hybrid_pool_assembler.py
+index 185abd5f88..4439f57751 100644
+--- a/test/registered/unit/mem_cache/test_hybrid_pool_assembler.py
++++ b/test/registered/unit/mem_cache/test_hybrid_pool_assembler.py
+@@ -1,17 +1,23 @@
+ """Unit tests for hybrid HiCache pool assembly."""
+ 
+ import unittest
++from contextlib import ExitStack
+ from types import SimpleNamespace
+ from unittest.mock import MagicMock, patch
+ 
++import torch
++
+ from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+     _evict_mamba_for_device_alloc,
+     _evict_swa_for_device_alloc,
+     _split_hicache_size,
+     build_full_draft_pools,
++    build_hybrid_mamba_stack,
+ )
+ from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
++from sglang.srt.mem_cache.pool_host.common import alloc_with_host_register
++from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+ from sglang.test.ci.ci_register import register_cpu_ci
+ from sglang.test.test_utils import CustomTestCase
+ 
+@@ -132,5 +138,269 @@ class TestDraftSidecarPoolDispatch(CustomTestCase):
+         self.assertIs(entries[0].host_pool, draft_host_pool)
+ 
+ 
++class _PackedRowGeometryFixtures:
++    """Fake MLA device pools with nominal-width and packed (wider) rows.
++
++    DSA device pools store packed rows wider than kv_lora_rank +
++    qk_rope_head_dim, the width the MLA host pool assumes without an
++    override.
++    """
++
++    KV_LORA_RANK = 8
++    QK_ROPE_HEAD_DIM = 4
++    NOMINAL_KV_CACHE_DIM = KV_LORA_RANK + QK_ROPE_HEAD_DIM
++    PACKED_KV_CACHE_DIM = 16  # > NOMINAL_KV_CACHE_DIM
++    PAGE_SIZE = 4
++    LAYER_NUM = 2
++
++    def _fake_device_pool(self, *, store_dtype, kv_cache_dim, layer_num=LAYER_NUM):
++        return SimpleNamespace(
++            size=64,
++            store_dtype=store_dtype,
++            kv_lora_rank=self.KV_LORA_RANK,
++            qk_rope_head_dim=self.QK_ROPE_HEAD_DIM,
++            kv_cache_dim=kv_cache_dim,
++            layer_num=layer_num,
++            start_layer=0,
++            end_layer=layer_num,
++            device="cpu",
++            layers_to_capture=None,
++            layer_shard_enabled=False,
++            data_ptrs=torch.zeros(layer_num, dtype=torch.uint64),
++            kv_buffer=[torch.empty(0, dtype=store_dtype) for _ in range(layer_num)],
++        )
++
++    def _fake_packed_device_pool(self, layer_num=LAYER_NUM):
++        return self._fake_device_pool(
++            store_dtype=torch.uint8,
++            kv_cache_dim=self.PACKED_KV_CACHE_DIM,
++            layer_num=layer_num,
++        )
++
++    def _fake_nominal_device_pool(self, layer_num=LAYER_NUM):
++        return self._fake_device_pool(
++            store_dtype=torch.bfloat16,
++            kv_cache_dim=self.NOMINAL_KV_CACHE_DIM,
++            layer_num=layer_num,
++        )
++
++    @staticmethod
++    def _alloc_unpinned(dims, dtype, device, pin_memory, allocator, **kwargs):
++        # Host rows are allocated without pinning so no CUDA context is needed.
++        return alloc_with_host_register(dims, dtype, device, False, allocator, **kwargs)
++
++
++class TestHybridMambaStackHostRowWidth(_PackedRowGeometryFixtures, CustomTestCase):
++    """The hybrid Mamba stack's MLA host pool must mirror the device rows.
++
++    Packed MTP draft layers share the target's host rows, so a draft pool
++    with a different row geometry must be rejected.
++    """
++
++    def _build_stack(self, kv_pool, *, use_mla, draft_pools=(), extra_patches=()):
++        """Build the hybrid Mamba stack with the real KV host pool class.
++
++        Patched: the published memory/parallel config and allocator lookup,
++        the MLA host pool's allocator (unpinned), plus the Mamba host pool,
++        host pool group, and cache controller, which are not under test.
++        Returns the HostPoolGroup constructor mock.
++        """
++        params = MagicMock()
++        params.page_size = self.PAGE_SIZE
++        wrapped_draft_pools = []
++        for pool in draft_pools:
++            wrapper = object.__new__(HybridLinearKVPool)
++            wrapper.full_kv_pool = pool
++            wrapped_draft_pools.append(wrapper)
++        params.mtp_draft_device_pools = tuple(wrapped_draft_pools)
++        memory = SimpleNamespace(
++            hicache_size=0,
++            hicache_ratio=2.0,
++            hicache_mem_layout="layer_first",
++            hicache_write_policy="write_through",
++            hicache_io_backend="direct",
++            hicache_host_memory_mode=None,
++        )
++        parallel = SimpleNamespace(dcp_enabled=False)
++        prefix = "sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler."
++
++        with ExitStack() as stack:
++            stack.enter_context(patch(prefix + "get_memory", return_value=memory))
++            stack.enter_context(patch(prefix + "get_parallel", return_value=parallel))
++            stack.enter_context(
++                patch(prefix + "_get_allocator_type", return_value="default")
++            )
++            stack.enter_context(
++                patch(
++                    "sglang.srt.mem_cache.pool_host.mla.ALLOC_MEMORY_FUNCS",
++                    {"cpu": self._alloc_unpinned},
++                )
++            )
++            stack.enter_context(patch(prefix + "MambaPoolHost"))
++            host_pool_group = stack.enter_context(patch(prefix + "HostPoolGroup"))
++            stack.enter_context(patch(prefix + "HybridCacheController"))
++            for extra_patch in extra_patches:
++                stack.enter_context(extra_patch)
++            build_hybrid_mamba_stack(
++                params=params,
++                server_args=SimpleNamespace(hicache_host_memory_mode="cache"),
++                kv_pool=kv_pool,
++                mamba_pool=MagicMock(),
++                full_layer_mapping={i: i for i in range(kv_pool.layer_num)},
++                mamba_layer_mapping={kv_pool.layer_num: kv_pool.layer_num},
++                load_cache_event=None,
++                storage_backend=None,
++                use_mla=use_mla,
++            )
++        return host_pool_group
++
++    def _kv_host_pool(self, host_pool_group):
++        entries = host_pool_group.call_args.args[0]
++        return entries[0].host_pool
++
++    def test_mla_host_pool_row_width_matches_packed_device_rows(self):
++        kv_pool = self._fake_packed_device_pool()
++        self.assertGreater(kv_pool.kv_cache_dim, self.NOMINAL_KV_CACHE_DIM)
++
++        kv_host_pool = self._kv_host_pool(self._build_stack(kv_pool, use_mla=True))
++
++        self.assertIsInstance(kv_host_pool, MLATokenToKVPoolHost)
++        self.assertEqual(kv_host_pool.kv_cache_dim, kv_pool.kv_cache_dim)
++        self.assertEqual(
++            kv_host_pool.token_stride_size,
++            kv_pool.kv_cache_dim * kv_pool.store_dtype.itemsize,
++        )
++        self.assertEqual(kv_host_pool.kv_buffer.shape[-1], kv_pool.kv_cache_dim)
++
++    def test_non_mla_pool_exposing_kv_cache_dim_gets_no_override(self):
++        # MHA host pool constructors take no override_kv_cache_dim; a non-MLA
++        # pool that happens to expose kv_cache_dim must not trigger one.
++        kv_pool = self._fake_packed_device_pool()
++        mha_host_cls = MagicMock(name="MHAHostPool")
++        prefix = "sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler."
++
++        self._build_stack(
++            kv_pool,
++            use_mla=False,
++            extra_patches=(
++                patch(prefix + "get_mha_host_pool_cls", return_value=mha_host_cls),
++            ),
++        )
++
++        mha_host_cls.assert_called_once()
++        self.assertNotIn("override_kv_cache_dim", mha_host_cls.call_args.kwargs)
++
++    def test_packed_draft_pool_with_target_geometry_is_accepted(self):
++        kv_pool = self._fake_packed_device_pool()
++        draft_pool = self._fake_packed_device_pool(layer_num=1)
++
++        kv_host_pool = self._kv_host_pool(
++            self._build_stack(kv_pool, use_mla=True, draft_pools=(draft_pool,))
++        )
++
++        self.assertEqual(kv_host_pool.layer_num, kv_pool.layer_num + 1)
++        self.assertEqual(kv_host_pool.kv_cache_dim, kv_pool.kv_cache_dim)
++        self.assertEqual(kv_host_pool.kv_buffer.shape[0], kv_pool.layer_num + 1)
++
++    def test_packed_draft_pool_with_narrower_rows_is_rejected(self):
++        # fp8 packed target, bf16 nominal-width draft.
++        kv_pool = self._fake_packed_device_pool()
++        draft_pool = self._fake_nominal_device_pool(layer_num=1)
++
++        with self.assertRaisesRegex(ValueError, "draft pool 0"):
++            self._build_stack(kv_pool, use_mla=True, draft_pools=(draft_pool,))
++
++    def test_packed_draft_pool_with_wider_rows_is_rejected(self):
++        # bf16 nominal-width target, fp8 packed draft.
++        kv_pool = self._fake_nominal_device_pool()
++        draft_pool = self._fake_packed_device_pool(layer_num=1)
++
++        with self.assertRaisesRegex(ValueError, "draft pool 0"):
++            self._build_stack(kv_pool, use_mla=True, draft_pools=(draft_pool,))
++
++    def test_same_dtype_draft_pool_with_different_width_is_rejected(self):
++        # Same store dtype, so only the row width differs: fp8 packed target,
++        # fp8 nominal-width draft.
++        kv_pool = self._fake_packed_device_pool()
++        draft_pool = self._fake_device_pool(
++            store_dtype=torch.uint8,
++            kv_cache_dim=self.NOMINAL_KV_CACHE_DIM,
++            layer_num=1,
++        )
++        self.assertEqual(draft_pool.store_dtype, kv_pool.store_dtype)
++
++        with self.assertRaisesRegex(ValueError, "draft pool 0"):
++            self._build_stack(kv_pool, use_mla=True, draft_pools=(draft_pool,))
++
++
++class TestMLAHostPoolRowGeometry(_PackedRowGeometryFixtures, CustomTestCase):
++    """MLATokenToKVPoolHost itself must refuse rows narrower than the device's.
++
++    Exercises the constructor directly so the check does not depend on a
++    builder passing the override.
++    """
++
++    def _host_pool(self, kv_pool, **kwargs):
++        with patch(
++            "sglang.srt.mem_cache.pool_host.mla.ALLOC_MEMORY_FUNCS",
++            {"cpu": self._alloc_unpinned},
++        ):
++            return MLATokenToKVPoolHost(
++                kv_pool,
++                host_to_device_ratio=2.0,
++                host_size=0,
++                page_size=self.PAGE_SIZE,
++                layout="layer_first",
++                pin_memory=False,
++                device="cpu",
++                **kwargs,
++            )
++
++    def test_packed_device_pool_without_override_is_rejected(self):
++        kv_pool = self._fake_packed_device_pool()
++
++        with self.assertRaisesRegex(ValueError, "override_kv_cache_dim"):
++            self._host_pool(kv_pool)
++
++    def test_packed_device_pool_without_override_and_nominal_draft_is_rejected(self):
++        # Without the override the assumed host width equals the nominal
++        # width, so a same-dtype nominal-width draft matches the assumed
++        # width while both differ from the packed device rows. The draft
++        # must be compared against the device pool's kv_cache_dim, not the
++        # assumed width.
++        kv_pool = self._fake_packed_device_pool()
++        draft_pool = self._fake_device_pool(
++            store_dtype=kv_pool.store_dtype,
++            kv_cache_dim=self.NOMINAL_KV_CACHE_DIM,
++            layer_num=1,
++        )
++
++        with self.assertRaisesRegex(ValueError, "row geometry"):
++            self._host_pool(kv_pool, mtp_draft_device_pools=(draft_pool,))
++
++    def test_packed_device_pool_with_override_and_matching_draft(self):
++        kv_pool = self._fake_packed_device_pool()
++        draft_pool = self._fake_packed_device_pool(layer_num=1)
++
++        host_pool = self._host_pool(
++            kv_pool,
++            override_kv_cache_dim=kv_pool.kv_cache_dim,
++            mtp_draft_device_pools=(draft_pool,),
++        )
++
++        self.assertEqual(host_pool.kv_cache_dim, kv_pool.kv_cache_dim)
++        self.assertEqual(host_pool.layer_num, kv_pool.layer_num + 1)
++        self.assertEqual(host_pool.kv_buffer.shape[-1], kv_pool.kv_cache_dim)
++
++    def test_nominal_device_pool_needs_no_override(self):
++        # Flat MLA callers pass no override; a nominal-width pool must still
++        # construct because its kv_cache_dim equals the assumed width.
++        kv_pool = self._fake_nominal_device_pool()
++
++        host_pool = self._host_pool(kv_pool)
++
++        self.assertEqual(host_pool.kv_cache_dim, self.NOMINAL_KV_CACHE_DIM)
++
++
+ if __name__ == "__main__":
+     unittest.main()

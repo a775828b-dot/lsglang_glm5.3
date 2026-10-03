@@ -1,0 +1,1 @@
+{"hybrid_prefill_max": 1792, "cpu_prefill_below": 640, "w4a4_prefill": "", "w8a8_prefill": "[.](self_attn|mlp)[.]"}
