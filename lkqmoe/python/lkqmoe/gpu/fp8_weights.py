@@ -51,7 +51,9 @@ def _w8_partial(X, W, S, P, M, N, K, SPAN, NG, BM: tl.constexpr, BN: tl.constexp
         kmask = ks < K
         x = tl.load(X + rows[:, None] * K + ks[None, :], mask=(rows[:, None] < M) & kmask[None, :], other=0.0)
         w = tl.load(W + cols[:, None] * K + ks[None, :], mask=cmask[:, None] & kmask[None, :], other=0.0)
-        s = tl.load(S + cols * NG + (k0 + kk) // 128, mask=cmask, other=0.0)
+        # the last split-K slice may extend past K: mask the group scale too (an unmasked read ran past the
+        # end of the scale tensor for the last row; harmless unless it hit unmapped memory or Inf/NaN bytes)
+        s = tl.load(S + cols * NG + (k0 + kk) // 128, mask=cmask & (k0 + kk < K), other=0.0)
         wb = (w.to(tl.float32) * s[:, None]).to(tl.bfloat16)
         acc = tl.dot(x, tl.trans(wb), acc)
     tl.store(P + (ps * BM + rows[:, None]) * N + cols[None, :], acc, mask=(rows[:, None] < M) & cmask[None, :])
@@ -97,8 +99,145 @@ def _config(n, k):
     return block_n, 128, slices
 
 
-def gemm_w8(x, q, s, bias=None):
-    """x [M,K] bf16 (M <= 16), q fp8 [N,K], s fp32 [N,K/128] -> [M,N] bf16."""
+@triton.jit
+def _w8_post(X, W, S, P, CNT, BIAS, Y, M, N, K, SPAN, NG, SLICES: tl.constexpr, BM: tl.constexpr,
+             BN: tl.constexpr, HAS_BIAS: tl.constexpr):
+    """Decode W8A16: FP8 -> BF16 (exact), one dot per 128-column group, the group sum scaled in FP32 (the
+    dequantized weight is never rounded to BF16). Split-K slices: the last CTA of a column tile adds the
+    slice partials in slice order (fixed order, deterministic) and resets the tile counter."""
+    pn = tl.program_id(0)
+    ps = tl.program_id(1)
+    rows = tl.arange(0, BM)
+    cols = pn * BN + tl.arange(0, BN)
+    cmask = cols < N
+    acc = tl.zeros((BM, BN), dtype=tl.float32)
+    k0 = ps * SPAN
+    for kk in range(0, SPAN, 128):
+        ks = k0 + kk + tl.arange(0, 128)
+        kmask = ks < K
+        x = tl.load(X + rows[:, None] * K + ks[None, :], mask=(rows[:, None] < M) & kmask[None, :], other=0.0)
+        w = tl.load(W + cols[:, None] * K + ks[None, :], mask=cmask[:, None] & kmask[None, :], other=0.0)
+        s = tl.load(S + cols * NG + (k0 + kk) // 128, mask=cmask & (k0 + kk < K), other=0.0)
+        acc += tl.dot(x, tl.trans(w.to(tl.bfloat16))) * s[None, :]
+    omask = (rows[:, None] < M) & cmask[None, :]
+    if SLICES == 1:
+        r = acc
+        if HAS_BIAS:
+            r += tl.load(BIAS + cols, mask=cmask, other=0.0).to(tl.float32)[None, :]
+        tl.store(Y + rows[:, None] * N + cols[None, :], r.to(tl.bfloat16), mask=omask)
+    else:
+        tl.store(P + (ps * BM + rows[:, None]) * N + cols[None, :], acc, mask=omask)
+        tl.debug_barrier()
+        done = tl.atomic_add(CNT + pn, 1, sem='acq_rel')
+        if done == SLICES - 1:
+            r = tl.zeros((BM, BN), dtype=tl.float32)
+            for sl in range(SLICES):
+                r += tl.load(P + (sl * BM + rows[:, None]) * N + cols[None, :], mask=omask, other=0.0,
+                             cache_modifier='.cg')
+            if HAS_BIAS:
+                r += tl.load(BIAS + cols, mask=cmask, other=0.0).to(tl.float32)[None, :]
+            tl.store(Y + rows[:, None] * N + cols[None, :], r.to(tl.bfloat16), mask=omask)
+            tl.atomic_xchg(CNT + pn, 0)
+
+
+@triton.jit
+def _w8_fused(X, W, S, P, CNT, BIAS, Y, M, N, K, SPAN, NG, SLICES: tl.constexpr, BM: tl.constexpr,
+              BN: tl.constexpr, BK: tl.constexpr, HAS_BIAS: tl.constexpr):
+    """Decode W8A16, same arithmetic as _w8_partial + _w8_reduce (dequantized weight rounded to BF16, same
+    split-K slices and slice order, so bitwise identical) in one launch: the last CTA of a column tile adds
+    the slice partials in slice order and resets the tile counter."""
+    pn = tl.program_id(0)
+    ps = tl.program_id(1)
+    rows = tl.arange(0, BM)
+    cols = pn * BN + tl.arange(0, BN)
+    cmask = cols < N
+    acc = tl.zeros((BM, BN), dtype=tl.float32)
+    k0 = ps * SPAN
+    for kk in range(0, SPAN, BK):
+        ks = k0 + kk + tl.arange(0, BK)
+        kmask = ks < K
+        x = tl.load(X + rows[:, None] * K + ks[None, :], mask=(rows[:, None] < M) & kmask[None, :], other=0.0)
+        w = tl.load(W + cols[:, None] * K + ks[None, :], mask=cmask[:, None] & kmask[None, :], other=0.0)
+        s = tl.load(S + cols * NG + (k0 + kk) // 128, mask=cmask & (k0 + kk < K), other=0.0)
+        wb = (w.to(tl.float32) * s[:, None]).to(tl.bfloat16)
+        acc = tl.dot(x, tl.trans(wb), acc)
+    omask = (rows[:, None] < M) & cmask[None, :]
+    if SLICES == 1:
+        r = acc
+        if HAS_BIAS:
+            r += tl.load(BIAS + cols, mask=cmask, other=0.0).to(tl.float32)[None, :]
+        tl.store(Y + rows[:, None] * N + cols[None, :], r.to(tl.bfloat16), mask=omask)
+    else:
+        tl.store(P + (ps * BM + rows[:, None]) * N + cols[None, :], acc, mask=omask)
+        tl.debug_barrier()
+        done = tl.atomic_add(CNT + pn, 1, sem='acq_rel')
+        if done == SLICES - 1:
+            r = tl.zeros((BM, BN), dtype=tl.float32)
+            for sl in range(SLICES):   # fixed order, as _w8_reduce
+                r += tl.load(P + (sl * BM + rows[:, None]) * N + cols[None, :], mask=omask, other=0.0,
+                             cache_modifier='.cg')
+            if HAS_BIAS:
+                r += tl.load(BIAS + cols, mask=cmask, other=0.0).to(tl.float32)[None, :]
+            tl.store(Y + rows[:, None] * N + cols[None, :], r.to(tl.bfloat16), mask=omask)
+            tl.atomic_xchg(CNT + pn, 0)
+
+
+# (N, K) -> (BN, warps, stages) of _w8_fused; slices stay those of _config (bitwise identical to the
+# two-kernel path). RTX PRO 5000, M=5, cold L2 (bench/w8_tune.py); other shapes: _config BN, 4 warps, 3 stages.
+_W8_FUSED_CFG = {(4096, 8192): (64, 4, 2), (16384, 1536): (64, 4, 2), (4096, 16384): (64, 4, 2),
+                 (4096, 1536): (32, 4, 2), (4096, 12288): (64, 4, 2), (4096, 4096): (128, 8, 2),
+                 (4096, 2048): (32, 4, 2)}
+
+
+# (N, K) -> (BN, slices, warps, stages): RTX PRO 5000, M=5, cold L2 (bench/w8_post.py)
+_W8_CFG = {(24576, 4096): (64, 1, 4, 4), (4096, 8192): (32, 4, 4, 3), (16384, 1536): (64, 1, 8, 3),
+           (4096, 16384): (32, 4, 4, 3), (4096, 1536): (32, 4, 4, 2), (4096, 12288): (64, 4, 8, 3),
+           (4096, 4096): (32, 4, 4, 2), (4096, 2048): (32, 4, 4, 2)}
+
+
+def _w8_config(n, k):
+    cfg = _W8_CFG.get((n, k))
+    if cfg is None:
+        cfg = (64, 1, 4, 4) if n >= 16384 else (32, min(4, k // 128), 4, 3)
+    return cfg
+
+
+def gemm_w8(x, q, s, bias=None, cnt=None):
+    """x [M,K] bf16 (M <= 16), q fp8 [N,K], s fp32 [N,K/128] -> [M,N] bf16.
+    cnt: int32 [>= N/32] zeros, the split-K tile counters (per layer, so CUDA graphs need no memset).
+    LKQMOE_FP8_DECODE_KERNEL: fused (default; one launch, bitwise identical to legacy), post (group sums
+    scaled after the dot: no BF16 rounding of the dequantized weight, finer but different from the prefill
+    dequant path, which lowered draft acceptance), legacy (split-K partial + reduce kernels)."""
+    mode = os.environ.get('LKQMOE_FP8_DECODE_KERNEL', 'fused')
+    if mode == 'fused':
+        m, k = x.shape
+        n = q.shape[0]
+        block_n, block_k, slices = _config(n, k)
+        span = triton.cdiv(triton.cdiv(k, slices), block_k) * block_k
+        slices = triton.cdiv(k, span)
+        bn, warps, stages = _W8_FUSED_CFG.get((n, k), (block_n, 4, 3))
+        if cnt is None or cnt.numel() < triton.cdiv(n, bn):
+            cnt = torch.zeros(triton.cdiv(n, bn), dtype=torch.int32, device=x.device)
+        part = torch.empty((slices, MAX_M, n), device=x.device, dtype=torch.float32) if slices > 1 else x
+        y = torch.empty((m, n), device=x.device, dtype=torch.bfloat16)
+        _w8_fused[(triton.cdiv(n, bn), slices)](x, q, s, part, cnt, bias if bias is not None else x, y, m, n, k, span,
+                                                k // GROUP, slices, MAX_M, bn, block_k, bias is not None,
+                                                num_warps=warps, num_stages=stages)
+        return y
+    if mode == 'post':
+        m, k = x.shape
+        n = q.shape[0]
+        bn, slices, warps, stages = _w8_config(n, k)
+        span = triton.cdiv(triton.cdiv(k, slices), 128) * 128
+        slices = triton.cdiv(k, span)
+        if cnt is None:
+            cnt = torch.zeros(triton.cdiv(n, bn), dtype=torch.int32, device=x.device)
+        part = torch.empty((slices, MAX_M, n), device=x.device, dtype=torch.float32) if slices > 1 else x
+        y = torch.empty((m, n), device=x.device, dtype=torch.bfloat16)
+        _w8_post[(triton.cdiv(n, bn), slices)](x, q, s, part, cnt, bias if bias is not None else x, y, m, n, k, span,
+                                               k // GROUP, slices, MAX_M, bn, bias is not None,
+                                               num_warps=warps, num_stages=stages)
+        return y
     m, k = x.shape
     n = q.shape[0]
     block_n, block_k, slices = _config(n, k)
@@ -302,7 +441,7 @@ def _forward(layer, x, bias):
         x2 = x2.contiguous()
     if m <= MAX_M:
         stats['decode_calls'] += 1
-        y = gemm_w8(x2, q, s, bias)
+        y = gemm_w8(x2, q, s, bias, getattr(layer, '_lkqmoe_w8_cnt', None))
     else:
         stats['prefill_calls'] += 1
         gs = getattr(layer, '_lkqmoe_w4a4_gs', None)
@@ -347,6 +486,11 @@ def quantize_model(model):
         if not isinstance(getattr(layer, 'quant_method', None), method_cls):
             continue
         w = getattr(layer, 'weight', None)
+        if (os.environ.get('LKQMOE_SMALL_M_GEMM') == '1' and isinstance(w, torch.Tensor) and w.is_cuda
+                and w.dtype == torch.bfloat16 and w.dim() == 2 and getattr(layer, '_lkqmoe_sg_cnt', None) is None):
+            # split-K tile counters for the one-launch small-M BF16 GEMM (small_gemm.gemm) of layers that stay
+            # BF16; zero, each use resets its entries (unused if the layer is converted below)
+            layer._lkqmoe_sg_cnt = torch.zeros(triton.cdiv(w.shape[0], 16), dtype=torch.int32, device=w.device)
         if (w is None or not isinstance(w, torch.Tensor) or not w.is_cuda or w.dtype != torch.bfloat16
                 or w.dim() != 2 or w.shape[1] % GROUP or w.numel() < min_elems
                 or getattr(layer, '_lkqmoe_fp8_scale', None) is not None):
@@ -374,6 +518,8 @@ def quantize_model(model):
         q, sc = quantize(w.data)
         layer.weight = torch.nn.Parameter(q, requires_grad=False)
         layer._lkqmoe_fp8_scale = sc
+        # split-K tile counters of the decode kernel (zero; each use resets its own entries)
+        layer._lkqmoe_w8_cnt = torch.zeros(triton.cdiv(q.shape[0], 32), dtype=torch.int32, device=q.device)
         layer._lkqmoe_name = name
         stats['layers'] += 1; count += 1
         stats['bf16_bytes'] += w.numel() * 2

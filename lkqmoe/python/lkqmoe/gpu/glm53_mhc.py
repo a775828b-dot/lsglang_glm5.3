@@ -136,6 +136,110 @@ def mhc_pre_fused(residual, fn, hc_scale, hc_base, rms_eps, hc_pre_eps,
     return post.unsqueeze(-1), comb, layer_input
 
 
+@triton.jit
+def _post_proj_partial_kernel(x_ptr, res_ptr, post_ptr, comb_ptr, out_ptr, fn_ptr, part_ptr, sq_ptr, s, H, K, k_chunk,
+                              N: tl.constexpr, M: tl.constexpr, MP: tl.constexpr, BS: tl.constexpr, BK: tl.constexpr):
+    """mHC post of the attention sublayer fused into the projection of the following MLP-sublayer pre.
+    For its slice of the flattened (stream, hidden) axis each program computes the post output
+    out[b,h] = post[b]*x[h] + sum_a comb[a,b]*res[a,h] (as _mhc_post_kernel), stores it in the residual
+    dtype and feeds the stored value to the same FP32 projection / sum of squares as _proj_partial_kernel."""
+    pid_s = tl.program_id(0)
+    pid_k = tl.program_id(1)
+    rows = pid_s * BS + tl.arange(0, BS)
+    cols = tl.arange(0, MP)
+    na = tl.arange(0, N)
+    rmask = rows < s
+    cmask = cols < M
+    acc = tl.zeros((BS, MP), dtype=tl.float32)
+    sq = tl.zeros((BS,), dtype=tl.float32)
+    k0 = pid_k * k_chunk
+    for kk in range(0, k_chunk, BK):
+        ks = k0 + kk + tl.arange(0, BK)
+        kmask = ks < K
+        b = ks // H
+        hc = ks - b * H
+        m2 = rmask[:, None] & kmask[None, :]
+        m3 = m2[:, None, :]
+        xv = tl.load(x_ptr + rows[:, None] * H + hc[None, :], mask=m2, other=0.0).to(tl.float32)
+        pb = tl.load(post_ptr + rows[:, None] * N + b[None, :], mask=m2, other=0.0).to(tl.float32)
+        cab = tl.load(comb_ptr + rows[:, None, None] * (N * N) + na[None, :, None] * N + b[None, None, :],
+                      mask=m3, other=0.0).to(tl.float32)
+        ra = tl.load(res_ptr + rows[:, None, None] * K + na[None, :, None] * H + hc[None, None, :],
+                     mask=m3, other=0.0).to(tl.float32)
+        o = tl.sum(cab * ra, axis=1)
+        o = o + pb * xv
+        o = o.to(out_ptr.dtype.element_ty)
+        tl.store(out_ptr + rows[:, None] * K + ks[None, :], o, mask=m2)
+        xr = o.to(tl.float32)
+        w = tl.load(fn_ptr + cols[:, None] * K + ks[None, :], mask=cmask[:, None] & kmask[None, :], other=0.0)
+        acc = tl.dot(xr, tl.trans(w), acc, input_precision='ieee')
+        sq += tl.sum(xr * xr, axis=1)
+    base = pid_k * s
+    tl.store(part_ptr + (base + rows[:, None]) * MP + cols[None, :], acc, mask=rmask[:, None])
+    tl.store(sq_ptr + base + rows, sq, mask=rmask)
+
+
+def mhc_post_pre_fused(x, residual, h_post, h_res, fn, hc_scale, hc_base, rms_eps, hc_pre_eps,
+                       hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat, n):
+    """hc_post(x, residual, h_post, h_res) followed by hc_pre of the next sublayer, decode sizes (s <= 64).
+    x [s,h], residual [s,n*h], h_post [s,n], h_res [s,n*n] -> (new residual [s,n*h], layer_input [s,h],
+    comb [s,n*n], post [s,n]): the same values as the two separate calls."""
+    s, h = x.shape
+    K = n * h
+    M = fn.shape[0]
+    assert fn.dtype == torch.float32 and M == 2 * n + n * n and fn.shape[1] == K
+    MP = max(16, triton.next_power_of_2(M))
+    BS, BK = 16, 64
+    split = 64 if K % (64 * BK) == 0 else 1
+    k_chunk = K // split
+    dev = x.device
+    out = torch.empty((s, n, h), device=dev, dtype=x.dtype)
+    part = torch.empty((split, s, MP), device=dev, dtype=torch.float32)
+    sq = torch.empty((split, s), device=dev, dtype=torch.float32)
+    _post_proj_partial_kernel[(triton.cdiv(s, BS), split)](
+        x.contiguous(), residual.contiguous(), h_post.contiguous(), h_res.contiguous(), out, fn.contiguous(),
+        part, sq, s, h, K, k_chunk, N=n, M=M, MP=MP, BS=BS, BK=BK, num_warps=4)
+    pre = torch.empty((s, n), device=dev, dtype=torch.float32)
+    post = torch.empty((s, n), device=dev, dtype=torch.float32)
+    comb = torch.empty((s, n, n), device=dev, dtype=torch.float32)
+    layer_input = torch.empty((s, h), device=dev, dtype=x.dtype)
+    _tail_kernel[(s,)](
+        part, sq, hc_scale, hc_base, out, K, pre, post, comb, layer_input,
+        s, split, 1.0 / K, rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, h,
+        SINKHORN=sinkhorn_repeat, N=n, MP=MP, BH=1024, num_warps=4)
+    return out.view(s, K), layer_input, comb.view(s, n * n), post
+
+
+_COMM = 'sglang.srt.layers.communicator_mhc'
+
+
+def patch_communicator(module):
+    """LKQMOE_GLM53_MHC_FUSE_POST=1: MHCState.attn_to_mlp (attention post + MLP pre of one decoder layer)
+    runs mhc_post_pre_fused for decode sizes; other sizes / layers keep the original two calls."""
+    state = getattr(module, 'MHCState', None)
+    if state is None or getattr(state, '_lkqmoe_fuse_post', False):
+        return
+    original = state.attn_to_mlp
+
+    def attn_to_mlp(self, hidden_states, residual, out_norm=None):
+        layer = getattr(self.hc_ffn_pre, '__self__', None)
+        cfg = getattr(layer, 'config', None)
+        if (cfg is not None and getattr(layer, 'hc_ffn_fn', None) is not None and hidden_states.dim() == 2
+                and 1 <= hidden_states.shape[0] <= 64 and self.h_res is not None and self.h_post is not None
+                and hidden_states.is_cuda and self.hc_mult & (self.hc_mult - 1) == 0):
+            residual, hidden_states, self.h_res, self.h_post = mhc_post_pre_fused(
+                hidden_states, residual, self.h_post, self.h_res, layer.hc_ffn_fn, layer.hc_ffn_scale,
+                layer.hc_ffn_base, cfg.rms_norm_eps, cfg.hc_eps, cfg.hc_eps, 2.0, cfg.hc_sinkhorn_iters, self.hc_mult)
+            if out_norm is not None:
+                hidden_states = out_norm(hidden_states)
+            return hidden_states, residual
+        return original(self, hidden_states, residual, out_norm)
+
+    state.attn_to_mlp = attn_to_mlp
+    state._lkqmoe_fuse_post = True
+    print('[lkqmoe] GLM-5.3 mHC post fused into the next pre (attention -> MLP)', file=sys.stderr, flush=True)
+
+
 def patch(module):
     if getattr(module, '_lkqmoe_glm53_mhc', False):
         return
@@ -157,12 +261,12 @@ class _Loader(importlib.abc.Loader):
 
     def exec_module(self, module):
         self.delegate.exec_module(module)
-        patch(module)
+        (patch_communicator if module.__name__ == _COMM else patch)(module)
 
 
 class _Finder(importlib.abc.MetaPathFinder):
     def find_spec(self, fullname, path=None, target=None):
-        if fullname != _TARGET:
+        if fullname != _TARGET and not (fullname == _COMM and os.environ.get('LKQMOE_GLM53_MHC_FUSE_POST') == '1'):
             return None
         spec = importlib.machinery.PathFinder.find_spec(fullname, path, target)
         if spec and spec.loader:
@@ -173,5 +277,7 @@ class _Finder(importlib.abc.MetaPathFinder):
 def install():
     if _TARGET in sys.modules:
         patch(sys.modules[_TARGET])
-    elif not any(isinstance(f, _Finder) for f in sys.meta_path):
+    if os.environ.get('LKQMOE_GLM53_MHC_FUSE_POST') == '1' and _COMM in sys.modules:
+        patch_communicator(sys.modules[_COMM])
+    if not any(isinstance(f, _Finder) for f in sys.meta_path):
         sys.meta_path.insert(0, _Finder())

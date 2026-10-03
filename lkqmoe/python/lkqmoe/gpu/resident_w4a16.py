@@ -159,6 +159,29 @@ def _down(MID, SLOT_E, Q2, S2, G2, PART, M, H, I, R2P, C2P,
 
 
 @triton.jit
+def _slot_map(IDS, NIDS, USED, RANK, SLOT_E, ROUTE_SLOT, E, NSLOTS, BE: tl.constexpr, BI: tl.constexpr):
+    """One program: used experts -> slots (rank among used experts), slot -> expert (-1 when empty,
+    entry NSLOTS is the sink) and route -> slot. Same integers as the torch scatter / cumsum sequence."""
+    e = tl.arange(0, BE)
+    emask = e < E
+    tl.store(USED + e, 0, mask=emask)
+    j = tl.arange(0, 2 * BI)
+    tl.store(SLOT_E + j, -1, mask=j < NSLOTS + 1)
+    tl.debug_barrier()
+    i = tl.arange(0, BI)
+    imask = i < NIDS
+    ids = tl.load(IDS + i, mask=imask, other=0).to(tl.int32)
+    tl.store(USED + ids, 1, mask=imask)
+    tl.debug_barrier()
+    used = tl.load(USED + e, mask=emask, other=0)
+    rank = tl.cumsum(used, 0) - 1
+    tl.store(RANK + e, rank, mask=emask)
+    tl.store(SLOT_E + rank, e, mask=emask & (used > 0))
+    tl.debug_barrier()
+    tl.store(ROUTE_SLOT + i, tl.load(RANK + ids, mask=imask, other=0), mask=imask)
+
+
+@triton.jit
 def _combine(PART, ROUTE_SLOT, W, OUT, M, H, K: tl.constexpr, BM: tl.constexpr, B: tl.constexpr):
     t = tl.program_id(0)
     h = tl.program_id(1) * B + tl.arange(0, B)
@@ -352,17 +375,26 @@ def moe_w4a16(x, topk_ids, topk_w, q13, s13, g13, q2, s2, g2, limit):
     E, two_i, _ = q13.shape
     i = two_i // 2
     dev = x.device
-    ids = topk_ids.to(torch.int64)
-    # used experts -> slots (static shapes): slot index = rank of the expert among used ones
-    used = torch.zeros(E, dtype=torch.int32, device=dev)
-    used.scatter_(0, ids.reshape(-1), 1)
-    rank = torch.cumsum(used, 0) - 1                      # slot of every used expert
     nslots = m * k
-    slot_e = torch.full((nslots + 1,), -1, dtype=torch.int32, device=dev)   # last entry: sink for unused experts
-    ar = torch.arange(E, dtype=torch.int32, device=dev)
-    slot_e.scatter_(0, torch.where(used.bool(), rank, torch.full_like(rank, nslots)).long(),
-                    torch.where(used.bool(), ar, torch.full_like(ar, -1)))
-    route_slot = rank[ids].to(torch.int32).contiguous()
+    if os.environ.get('LKQMOE_RESIDENT_W4A16_TORCH_MAP') != '1' and E <= 1024 and nslots <= 256:
+        # used experts -> slots in one kernel (static shapes): slot index = rank of the expert among used ones
+        ids = topk_ids.contiguous()
+        used = torch.empty(E, dtype=torch.int32, device=dev)
+        rank = torch.empty(E, dtype=torch.int32, device=dev)
+        slot_e = torch.empty((nslots + 1,), dtype=torch.int32, device=dev)   # last entry: sink for unused experts
+        route_slot = torch.empty((m, k), dtype=torch.int32, device=dev)
+        _slot_map[(1,)](ids, nslots, used, rank, slot_e, route_slot, E, nslots, triton.next_power_of_2(E),
+                        triton.next_power_of_2(nslots), num_warps=4)
+    else:
+        ids = topk_ids.to(torch.int64)
+        used = torch.zeros(E, dtype=torch.int32, device=dev)
+        used.scatter_(0, ids.reshape(-1), 1)
+        rank = torch.cumsum(used, 0) - 1                      # slot of every used expert
+        slot_e = torch.full((nslots + 1,), -1, dtype=torch.int32, device=dev)   # last entry: sink for unused experts
+        ar = torch.arange(E, dtype=torch.int32, device=dev)
+        slot_e.scatter_(0, torch.where(used.bool(), rank, torch.full_like(rank, nslots)).long(),
+                        torch.where(used.bool(), ar, torch.full_like(ar, -1)))
+        route_slot = rank[ids].to(torch.int32).contiguous()
     # every slot serves all tokens; weights of tokens not routed to it are applied as 0 in _combine
     xb = x.to(torch.bfloat16).contiguous()
     cfg = CONFIG

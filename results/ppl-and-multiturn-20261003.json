@@ -3,95 +3,95 @@
  "ppl": {
   "method": "bench/ppl_eval.py --tokens 4096 --segments 6 (13 segments: docs, agent sessions, Chinese doc)",
   "runs": {
-   "final-v17-1": {
+   "lsglang_glm5.3-1": {
     "docs": {
      "segments": 6,
-     "nll": 1.50004,
-     "ppl": 4.4819
+     "nll": 1.49765,
+     "ppl": 4.4712
     },
     "agent": {
      "segments": 6,
-     "nll": 1.18186,
-     "ppl": 3.2604
+     "nll": 1.18033,
+     "ppl": 3.2554
     },
     "zh": {
      "segments": 1,
-     "nll": 2.17378,
-     "ppl": 8.7915
+     "nll": 2.17362,
+     "ppl": 8.79
     },
     "all": {
      "segments": 13,
-     "nll": 1.40502,
-     "ppl": 4.0756
+     "nll": 1.40319,
+     "ppl": 4.0682
     }
    },
-   "final-v17-2": {
+   "lsglang_glm5.3-2": {
     "docs": {
      "segments": 6,
-     "nll": 1.49913,
-     "ppl": 4.4778
+     "nll": 1.50064,
+     "ppl": 4.4846
     },
     "agent": {
      "segments": 6,
-     "nll": 1.18024,
-     "ppl": 3.2551
+     "nll": 1.17986,
+     "ppl": 3.2539
     },
     "zh": {
      "segments": 1,
-     "nll": 2.16851,
-     "ppl": 8.7453
+     "nll": 2.17236,
+     "ppl": 8.779
     },
     "all": {
      "segments": 13,
-     "nll": 1.40344,
-     "ppl": 4.0692
+     "nll": 1.40426,
+     "ppl": 4.0725
     }
    },
-   "final-v17-3": {
+   "lsglang_glm5.3-3": {
     "docs": {
      "segments": 6,
-     "nll": 1.49889,
-     "ppl": 4.4767
+     "nll": 1.50104,
+     "ppl": 4.4864
     },
     "agent": {
      "segments": 6,
-     "nll": 1.18194,
-     "ppl": 3.2607
+     "nll": 1.1804,
+     "ppl": 3.2557
     },
     "zh": {
      "segments": 1,
-     "nll": 2.17126,
-     "ppl": 8.7693
+     "nll": 2.1676,
+     "ppl": 8.7373
     },
     "all": {
      "segments": 13,
-     "nll": 1.40433,
+     "nll": 1.40432,
      "ppl": 4.0728
     }
    },
-   "final-v17-4": {
+   "lsglang_glm5.3-4": {
     "docs": {
      "segments": 6,
-     "nll": 1.49804,
-     "ppl": 4.4729
+     "nll": 1.5,
+     "ppl": 4.4817
     },
     "agent": {
      "segments": 6,
-     "nll": 1.18214,
-     "ppl": 3.2614
+     "nll": 1.18091,
+     "ppl": 3.2573
     },
     "zh": {
      "segments": 1,
-     "nll": 2.17648,
-     "ppl": 8.8153
+     "nll": 2.17445,
+     "ppl": 8.7974
     },
     "all": {
      "segments": 13,
-     "nll": 1.40443,
-     "ppl": 4.0732
+     "nll": 1.40461,
+     "ppl": 4.0739
     }
    },
-   "final-closedlk-1": {
+   "closed-lk_moe-1": {
     "docs": {
      "segments": 6,
      "nll": 1.48601,
@@ -113,7 +113,7 @@
      "ppl": 4.0537
     }
    },
-   "final-closedlk-2": {
+   "closed-lk_moe-2": {
     "docs": {
      "segments": 6,
      "nll": 1.48514,
@@ -139,9 +139,8 @@
  },
  "multi_turn_decode": {
   "method": "bench/spec_bench.py PORT TAG 2 (6 prompts x 2 rounds, max 700 tokens, temp 0)",
-  "lkqmoe_tok_s": [
-   61.7,
-   61.3
+  "lsglang_glm53_tok_s": [
+   61.66
   ],
   "closed_lk_moe_tok_s": [
    38.77
