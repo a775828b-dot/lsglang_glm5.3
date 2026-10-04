@@ -261,6 +261,63 @@ index 0000000000..95aabe854e
 +        s, h, BLOCK_H=BLOCK_H, N=n, num_warps=4,
 +    )
 +    return out
+diff --git a/python/sglang/kernels/ops/speculative/reject_sampling.py b/python/sglang/kernels/ops/speculative/reject_sampling.py
+index fd32ca3ea1..02e57ccd00 100644
+--- a/python/sglang/kernels/ops/speculative/reject_sampling.py
++++ b/python/sglang/kernels/ops/speculative/reject_sampling.py
+@@ -14,6 +14,7 @@ def speculative_sampling_classic_kernel(
+     UniformSamplesFinal,
+     TargetProbs,
+     DraftProbs,
++    MaxAccept,
+     # Strides
+     stride_cand_b,
+     stride_cand_s,
+@@ -31,6 +32,7 @@ def speculative_sampling_classic_kernel(
+     NUM_SLOTS: tl.constexpr,
+     VOCAB_SIZE: tl.constexpr,
+     BLOCK_V: tl.constexpr,
++    HAS_LIMIT: tl.constexpr,
+ ):
+     pid = tl.program_id(0)
+     cur_prob_row = 0
+@@ -48,8 +50,12 @@ def speculative_sampling_classic_kernel(
+     # Verification Loop
+     step = 1
+     continue_verifying = 1
+-
+-    while (step < NUM_SLOTS) and (continue_verifying == 1):
++    # Truncated verify: drafts past the limit are not tested; when every tested draft is
++    # accepted the final token is sampled from p (all_drafts_accepted), as for a shorter chain.
++    limit = NUM_SLOTS - 1
++    if HAS_LIMIT:
++        limit = tl.load(MaxAccept + pid)
++    while (step < NUM_SLOTS) and (step <= limit) and (continue_verifying == 1):
+         draft_token = tl.load(cand_ptr_base + step * stride_cand_s)
+ 
+         offset_prob = (
+@@ -175,6 +181,7 @@ def chain_speculative_sampling_triton(
+     threshold_single,
+     threshold_acc,
+     deterministic,  # not used
++    max_accept=None,
+ ):
+     batch_size, num_slots = candidates.shape
+     vocab_size = target_probs.shape[-1]
+@@ -190,6 +197,7 @@ def chain_speculative_sampling_triton(
+         uniform_samples_for_final_sampling,
+         target_probs,
+         draft_probs,
++        max_accept if max_accept is not None else accept_token_num,
+         candidates.stride(0),
+         candidates.stride(1),
+         retrive_index.stride(0),
+@@ -205,4 +213,5 @@ def chain_speculative_sampling_triton(
+         NUM_SLOTS=num_slots,
+         VOCAB_SIZE=vocab_size,
+         BLOCK_V=4096,
++        HAS_LIMIT=max_accept is not None,
+     )
 diff --git a/python/sglang/srt/arg_groups/overrides.py b/python/sglang/srt/arg_groups/overrides.py
 index 4efb6217ee..c88fa419ff 100644
 --- a/python/sglang/srt/arg_groups/overrides.py
@@ -1442,11 +1499,222 @@ index 589f74ce13..1b69044406 100644
              # Set attention backend for DeepSeek
              if is_deepseek_dsa(hf_config):  # DeepSeek 3.2/GLM 5
                  if envs.SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.is_set():
+diff --git a/python/sglang/srt/speculative/eagle_draft_cuda_graph_runner.py b/python/sglang/srt/speculative/eagle_draft_cuda_graph_runner.py
+index aae5927c3d..50a73ae55f 100644
+--- a/python/sglang/srt/speculative/eagle_draft_cuda_graph_runner.py
++++ b/python/sglang/srt/speculative/eagle_draft_cuda_graph_runner.py
+@@ -5,6 +5,8 @@ from typing import TYPE_CHECKING, Callable, Optional
+ 
+ import torch
+ 
++from sglang.srt.speculative.spec_utils import rs_draft_temperatures
++
+ from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
+ from sglang.srt.environ import envs
+ from sglang.srt.layers.dp_attention import (
+@@ -191,9 +193,16 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
+             extend_seq_lens = torch.ones((self.max_bs,), dtype=torch.int32)
+             topk_p = torch.zeros((self.max_bs, self.topk), dtype=torch.float32)
+             topk_index = torch.zeros((self.max_bs, self.topk), dtype=torch.int64)
++            # Draft (possibly hot-token) vocab width; verify gets the target vocab after
++            # EagleDraftWorker._scatter_hot_draft_probs.
++            _hot = getattr(self.eagle_worker, "hot_token_id", None)
+             draft_probs = (
+                 torch.zeros(
+-                    (self.max_bs, self.model_runner.model_config.vocab_size),
++                    (
++                        self.max_bs,
++                        _hot.shape[0] if _hot is not None
++                        else self.model_runner.model_config.vocab_size,
++                    ),
+                     dtype=torch.float32,
+                 )
+                 if self.model_runner.server_args.speculative_use_rejection_sampling
+@@ -610,7 +619,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
+             and forward_batch.sampling_info is not None
+         ):
+             self.temperatures[:raw_bs].copy_(
+-                forward_batch.sampling_info.temperatures[:raw_bs]
++                rs_draft_temperatures(forward_batch.sampling_info)[:raw_bs]
+             )
+ 
+         # TODO(ch-wan): support num_token_non_padded
+diff --git a/python/sglang/srt/speculative/eagle_info.py b/python/sglang/srt/speculative/eagle_info.py
+index a927efc8bf..f6346ed32d 100644
+--- a/python/sglang/srt/speculative/eagle_info.py
++++ b/python/sglang/srt/speculative/eagle_info.py
+@@ -34,6 +34,10 @@ class EagleVerifyInput(SpecInput):
+     # Shape info for padding
+     num_tokens_per_req: int = -1  # -1 auto-fills from draft_token_num.
+ 
++    # Rejection sampling: per-request maximum accepted drafts (int32, bs) after verify
++    # truncation (EAGLEWorkerV2._truncate_verify); None = all drafts.
++    rs_max_accept: Optional[torch.Tensor] = None
++
+     def __post_init__(self):
+         super().__init__(SpecInputType.EAGLE_VERIFY)
+         if self.num_tokens_per_req < 0:
+diff --git a/python/sglang/srt/speculative/eagle_utils.py b/python/sglang/srt/speculative/eagle_utils.py
+index 4d6468a039..af8ee4d646 100644
+--- a/python/sglang/srt/speculative/eagle_utils.py
++++ b/python/sglang/srt/speculative/eagle_utils.py
+@@ -2,6 +2,7 @@ from __future__ import annotations
+ 
+ import logging
+ import math
++import os
+ from enum import IntEnum
+ from typing import TYPE_CHECKING, List, Optional, Tuple
+ 
+@@ -61,6 +62,49 @@ elif _is_cpu:
+     from sgl_kernel import verify_tree_greedy_cpu as sgl_verify_tree_greedy_cpu
+ 
+ 
++_SPEC_TRACE_FILE = os.environ.get("SGLANG_SPEC_TRACE_FILE")
++_spec_trace_lines = []
++_SPEC_TRACE_SCALES = [float(x) for x in os.environ.get("SGLANG_SPEC_TRACE_SCALES", "1.0,0.9,0.8,0.7,0.6,0.5").split(",")]
++
++
++def _spec_trace_record(candidates, target_probs, draft_probs, num_correct_drafts, sampling_info):
++    """Experiment: p and q of each drafted token, accepted count (see SGLANG_SPEC_TRACE_FILE)."""
++    import json as _json
++    import time as _time
++
++    c = candidates[:, 1:].long().unsqueeze(-1)
++    p = target_probs[:, : c.shape[1]].gather(2, c).squeeze(-1)
++    q = draft_probs[:, : c.shape[1]].gather(2, c).squeeze(-1)
++    top_ks = getattr(sampling_info, "top_ks", None)
++    greedy = (top_ks.reshape(-1)[: p.shape[0]] == 1) if top_ks is not None else torch.zeros_like(p[:, 0], dtype=torch.bool)
++    from sglang.srt.speculative.spec_utils import _rs_draft_temp_scale
++
++    s0 = _rs_draft_temp_scale()
++    tp = target_probs[:, : c.shape[1]]
++    dq = draft_probs[:, : c.shape[1]].float()
++    alphas = []
++    for sc in _SPEC_TRACE_SCALES:
++        qs = dq if sc == s0 else dq.pow(s0 / sc)
++        qs = qs / qs.sum(-1, keepdim=True).clamp_min(1e-30)
++        alphas.append(torch.minimum(tp, qs).sum(-1))
++    alpha = torch.stack(alphas, -1).reshape(p.shape[0], -1)
++    rows = torch.cat([p, q, num_correct_drafts.reshape(-1, 1).float(), greedy.reshape(-1, 1).float(), alpha], 1).cpu().tolist()
++    now = _time.time()
++    s = c.shape[1]
++    ns = len(_SPEC_TRACE_SCALES)
++    for r in rows:
++        a = r[2 * s + 2:]
++        _spec_trace_lines.append(_json.dumps({"t": round(now, 5), "p": [round(x, 5) for x in r[:s]],
++                                             "q": [round(x, 5) for x in r[s:2 * s]], "acc": int(r[2 * s]),
++                                             "greedy": int(r[2 * s + 1]), "s0": s0,
++                                             "alpha": [[round(a[j * ns + k], 5) for k in range(ns)] for j in range(s)]}))
++    if len(_spec_trace_lines) >= 64:
++        with open(_SPEC_TRACE_FILE, "a") as f:
++            f.write("\n".join(_spec_trace_lines) + "\n")
++        _spec_trace_lines.clear()
++
++
++
+ def per_step_draft_out_cache_loc(
+     out_cache_loc: torch.Tensor,
+     batch_size: int,
+@@ -878,7 +922,16 @@ def eagle_sample(
+                 threshold_single=get_spec().speculative_accept_threshold_single,
+                 threshold_acc=get_spec().speculative_accept_threshold_acc,
+                 deterministic=True,
++                **(
++                    {"max_accept": verify_input.rs_max_accept}
++                    if use_rejection_sampling and verify_input.rs_max_accept is not None
++                    else {}
++                ),
+             )
++            if _SPEC_TRACE_FILE and use_rejection_sampling:
++                _spec_trace_record(
++                    candidates, target_probs, draft_probs, num_correct_drafts, sampling_info
++                )
+             del (
+                 expanded_temperature,
+                 target_probs,
 diff --git a/python/sglang/srt/speculative/eagle_worker_v2.py b/python/sglang/srt/speculative/eagle_worker_v2.py
-index 197bf8c2c3..46612b2bd1 100644
+index 197bf8c2c3..471fc953e7 100644
 --- a/python/sglang/srt/speculative/eagle_worker_v2.py
 +++ b/python/sglang/srt/speculative/eagle_worker_v2.py
-@@ -864,6 +864,29 @@ class EagleDraftWorker(EagleDraftWorkerBase):
+@@ -1,10 +1,13 @@
+ import contextlib
+ import logging
++import os
+ import time
+ from dataclasses import replace
+ from typing import List, Optional
+ 
+ import torch
++import triton
++import triton.language as tl
+ 
+ from sglang.kernels.ops.speculative.topk1 import draft_topk1_postprocess
+ from sglang.srt.configs.model_config import get_dsa_mtp_topk_width
+@@ -94,6 +97,7 @@ from sglang.srt.speculative.spec_utils import (
+     load_token_map,
+     record_stream_each,
+     renorm_draft_probs,
++    rs_draft_temperatures,
+     sample_draft_proposal,
+     select_top_k_tokens,
+     spec_stage_span,
+@@ -264,9 +268,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
+                 if self.hot_token_id is not None
+                 else target_vocab_size
+             )
+-            # FIXME: support reduced (hot) draft vocab by scattering draft probs
+-            # into the target vocab via the d2t map before the sampling kernel.
+-            if draft_vocab_size != target_vocab_size:
++            # Reduced (hot) draft vocab: draft() scatters the draft distribution into the
++            # target vocab before verify (q is zero outside the map, which the draft can never
++            # propose), so the accept test and the residual distribution stay exact.
++            self._rs_target_vocab = target_vocab_size
++            if draft_vocab_size != target_vocab_size and self.hot_token_id is None:
+                 raise ValueError(
+                     "--speculative-use-rejection-sampling requires the draft and "
+                     f"target to share one vocab, but the draft vocab "
+@@ -557,6 +563,17 @@ class EagleDraftWorker(EagleDraftWorkerBase):
+                 f"avail mem={after_mem:.2f} GB.",
+             )
+ 
++    def _scatter_hot_draft_probs(self, draft_probs: torch.Tensor) -> torch.Tensor:
++        """Hot-vocab draft distribution -> target vocab (zeros outside the token map)."""
++        idx = getattr(self, "_rs_hot_index", None)
++        if idx is None or idx.device != draft_probs.device:
++            idx = self._rs_hot_index = self.hot_token_id.to(
++                device=draft_probs.device, dtype=torch.long
++            )
++        full = draft_probs.new_zeros(*draft_probs.shape[:-1], self._rs_target_vocab)
++        full.index_copy_(full.dim() - 1, idx, draft_probs)
++        return full
++
+     def draft(self, batch: ScheduleBatch):
+         draft_input: EagleDraftInput = batch.spec_info
+         forward_batch, can_run_decode_cuda_graph = prepare_for_draft(
+@@ -605,6 +622,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
+                     self.draft_forward(forward_batch)
+                 )
+ 
++        if (
++            draft_probs is not None
++            and self.hot_token_id is not None
++            and draft_probs.shape[-1] != self._rs_target_vocab
++        ):
++            draft_probs = self._scatter_hot_draft_probs(draft_probs)
+         verify_input = build_eagle_verify_input(
+             batch,
+             draft_input,
+@@ -737,7 +760,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
+                 if get_spec().speculative_use_rejection_sampling:
+                     probs, topk_p, topk_index = sample_draft_proposal(
+                         logits_output.next_token_logits,
+-                        forward_batch.sampling_info.temperatures,
++                        rs_draft_temperatures(forward_batch.sampling_info),
+                     )
+                     draft_probs_list.append(probs)
+                     forward_batch.positions.add_(1)
+@@ -864,6 +887,29 @@ class EagleDraftWorker(EagleDraftWorkerBase):
              assert pt == batch.input_ids.numel()
              batch.input_ids = new_input_ids
  
@@ -1476,6 +1744,207 @@ index 197bf8c2c3..46612b2bd1 100644
          # Draft-extend spec_info for the extend forward; carries only
          # hidden_states + shape info.
          batch.spec_info = EagleDraftExtendInput(
+@@ -1099,7 +1145,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
+         if get_spec().speculative_use_rejection_sampling:
+             ret_draft_probs, ret_topk_p, ret_topk_index = sample_draft_proposal(
+                 draft_logits_output.next_token_logits,
+-                batch.sampling_info.temperatures,
++                rs_draft_temperatures(batch.sampling_info),
+             )
+         elif self.topk == 1 and not _is_hip:
+             # Gated to CUDA: see #26358 — ROCm's argmax tie-break corrupts
+@@ -1136,6 +1182,24 @@ class EagleDraftWorker(EagleDraftWorkerBase):
+             next_draft_input.dsa_topk_indices = dsa_seed_topk_indices
+ 
+ 
++@triton.jit
++def _truncate_verify_kernel(PROBS, TOKENS, TOPK, LIMIT, FLAGS, TH, stride_b, stride_s,
++                            S: tl.constexpr, HAS_TOPK: tl.constexpr, BLOCK: tl.constexpr):
++    """Per request: limit = leading drafts with q(x) >= TH (at least 1; all for top_k 1); flags of
++    the request's S + 1 verify tokens = position <= limit."""
++    b = tl.program_id(0)
++    j = tl.arange(0, BLOCK)
++    valid = j < S
++    tok = tl.load(TOKENS + b * (S + 1) + 1 + j, mask=valid, other=0).to(tl.int64)
++    q = tl.load(PROBS + b * stride_b + j * stride_s + tok, mask=valid, other=1.0)
++    lim = tl.min(tl.where(valid & (q < TH), j, S))
++    lim = tl.maximum(lim, 1)
++    if HAS_TOPK:
++        lim = tl.where(tl.load(TOPK + b) == 1, S, lim)
++    tl.store(LIMIT + b, lim)
++    tl.store(FLAGS + b * (S + 1) + j, (j <= lim).to(tl.int32), mask=j < S + 1)
++
++
+ class EAGLEWorkerV2(BaseSpecWorker):
+     def __init__(
+         self,
+@@ -1184,6 +1248,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
+         self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
+ 
+         self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
++        self._init_verify_truncation()
+ 
+     @property
+     def last_shared_read_runner(self):
+@@ -1290,7 +1355,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
+                     dtype=hidden_dtype,
+                     topk=self.topk,
+                     capture_hidden_mode=capture_mode,
+-                    vocab_size=self.target_worker.model_config.vocab_size,
++                    # draft_probs width = the draft (possibly hot-token) vocab
++                    vocab_size=(
++                        self.draft_worker.hot_token_id.shape[0]
++                        if getattr(self.draft_worker, "hot_token_id", None) is not None
++                        else self.target_worker.model_config.vocab_size
++                    ),
+                 )
+             if self.speculative_num_steps == 0:
+                 # Drafting disabled (high batch size). _draft_extend below still
+@@ -1318,9 +1388,14 @@ class EAGLEWorkerV2(BaseSpecWorker):
+                     spec_stage_span("draft"),
+                 ):
+                     verify_input: EagleVerifyInput = self.draft_worker.draft(batch)
++                if self._trunc_q is not None:
++                    self._truncate_verify(batch, verify_input)
+             assert verify_input.is_verify_input()
+             batch.spec_info = verify_input
+             batch_output = self.verify(batch, grammar_barrier=grammar_barrier)
++            if verify_input.rs_max_accept is not None:
++                # target verify enqueued: later CPU expert calls compute every token again
++                self._lkq_flags.fill_(1)
+             # Publish before draft_extend so the fence is at verify-end.
+             if on_publish is not None:
+                 on_publish(batch_output.new_seq_lens)
+@@ -1342,6 +1417,59 @@ class EAGLEWorkerV2(BaseSpecWorker):
+ 
+             return batch_output
+ 
++    def _init_verify_truncation(self):
++        """SGLANG_SPEC_TRUNCATE_Q: see _truncate_verify (lkqmoe LKQMOE_ACTIVE_FLAGS=1 required)."""
++        self._trunc_q = None
++        self._trunc_file = os.environ.get("SGLANG_SPEC_TRUNCATE_TUNE_FILE")
++        self._trunc_checked = 0.0
++        self._lkq_flags = None
++        value = os.environ.get("SGLANG_SPEC_TRUNCATE_Q")
++        if value is None and not self._trunc_file:
++            return
++        if not get_spec().speculative_use_rejection_sampling or self.topk != 1:
++            logger.warning("SGLANG_SPEC_TRUNCATE_Q needs rejection sampling with topk 1; ignored")
++            return
++        try:
++            from lkqmoe.zerocopy import active_flags
++
++            self._lkq_flags = active_flags()
++        except ImportError:
++            self._lkq_flags = None
++        if self._lkq_flags is None:
++            logger.warning("SGLANG_SPEC_TRUNCATE_Q needs lkqmoe with LKQMOE_ACTIVE_FLAGS=1; ignored")
++            return
++        self._trunc_q = float(value) if value is not None else 0.0
++        logger.info(f"verify truncation: draft q threshold {self._trunc_q}")
++
++    def _truncate_verify(self, batch: ScheduleBatch, verify_input: EagleVerifyInput):
++        """Keep each sampled request's leading drafts with q(x) >= threshold (at least one): the
++        verify accepts at most that many (lossless, as a shorter chain) and lkqmoe skips the CPU
++        experts of the other tokens. Greedy (top_k 1) requests keep every draft."""
++        if self._trunc_file and time.monotonic() - self._trunc_checked > 1.0:
++            self._trunc_checked = time.monotonic()
++            try:
++                self._trunc_q = float(open(self._trunc_file).read().split()[0])
++            except (OSError, ValueError, IndexError):
++                pass
++        probs = verify_input.draft_probs
++        if not self._trunc_q or probs is None or batch.forward_mode.is_idle():
++            return
++        bs, steps = probs.shape[0], probs.shape[1]
++        n = bs * (steps + 1)
++        if steps < 2 or n > self._lkq_flags.numel() or verify_input.draft_token.numel() != n:
++            return
++        if probs.stride(-1) != 1:
++            probs = probs.contiguous()
++        top_ks = getattr(batch.sampling_info, "top_ks", None)
++        has_topk = top_ks is not None and top_ks.device == probs.device
++        limit = torch.empty(bs, dtype=torch.int32, device=probs.device)
++        _truncate_verify_kernel[(bs,)](
++            probs, verify_input.draft_token, top_ks if has_topk else limit, limit, self._lkq_flags,
++            float(self._trunc_q), probs.stride(0), probs.stride(1),
++            S=steps, HAS_TOPK=has_topk, BLOCK=triton.next_power_of_2(steps + 1),
++        )
++        verify_input.rs_max_accept = limit
++
+     def _build_trivial_verify_input(self, batch: ScheduleBatch) -> EagleVerifyInput:
+         """Build a 1-node EagleVerifyInput rooted at the previous bonus token.
+ 
+diff --git a/python/sglang/srt/speculative/spec_utils.py b/python/sglang/srt/speculative/spec_utils.py
+index 18d48bf310..2ef96bcefc 100644
+--- a/python/sglang/srt/speculative/spec_utils.py
++++ b/python/sglang/srt/speculative/spec_utils.py
+@@ -148,6 +148,56 @@ def fast_sample(probs: torch.Tensor, num_samples: int = 1):
+     return sample_p, sample_index
+ 
+ 
++RS_GREEDY_DRAFT_TEMPERATURE = 1e-4
++# Draft temperature of sampled requests = request temperature x this scale (lossless for any value).
++RS_DRAFT_TEMP_SCALE = float(os.environ.get("SGLANG_RS_DRAFT_TEMP_SCALE", "1.0"))
++_RS_TUNE_FILE = os.environ.get("SGLANG_RS_DRAFT_TUNE_FILE")
++_rs_tune_checked = 0.0
++
++
++def _rs_draft_temp_scale():
++    global RS_DRAFT_TEMP_SCALE, _rs_tune_checked
++    if _RS_TUNE_FILE and time.monotonic() - _rs_tune_checked > 1.0:
++        _rs_tune_checked = time.monotonic()
++        try:
++            RS_DRAFT_TEMP_SCALE = float(open(_RS_TUNE_FILE).read().split()[0])
++        except (OSError, ValueError, IndexError):
++            pass
++    return RS_DRAFT_TEMP_SCALE
++
++
++_rs_temp_cache = None
++
++
++def rs_draft_temperatures(sampling_info, temperatures=None):
++    """Draft temperature per request under rejection sampling: greedy requests (top_k == 1,
++    which sglang runs as temperature 1.0 + top_k 1) draft at ~0, i.e. the draft argmax."""
++    global _rs_temp_cache
++    temps = sampling_info.temperatures if temperatures is None else temperatures
++    top_ks = getattr(sampling_info, "top_ks", None)
++    if top_ks is None or temps is None or top_ks.device != temps.device:
++        # CUDA-graph capture uses a CPU placeholder; the replay copies already-adjusted temperatures
++        return temps
++    scale = _rs_draft_temp_scale()
++    # Called several times per step with the batch's persistent tensors: reuse the result while
++    # they are the same, unmodified objects (the cache holds them, so their memory is not recycled).
++    c = _rs_temp_cache
++    if (
++        c is not None
++        and c[0] is temps
++        and c[1] is top_ks
++        and c[2] == temps._version
++        and c[3] == top_ks._version
++        and c[4] == scale
++    ):
++        return c[5]
++    greedy = (top_ks.reshape(-1)[: temps.shape[0]] == 1).reshape(temps.shape[0], *([1] * (temps.dim() - 1)))
++    sampled = temps * scale if scale != 1.0 else temps
++    out = torch.where(greedy, torch.full_like(temps, RS_GREEDY_DRAFT_TEMPERATURE), sampled)
++    _rs_temp_cache = (temps, top_ks, temps._version, top_ks._version, scale, out)
++    return out
++
++
+ def renorm_draft_probs(
+     next_token_logits: torch.Tensor,
+     sampling_info,
+@@ -161,7 +211,7 @@ def renorm_draft_probs(
+     """
+     if not use_rejection_sampling or not next_token_logits.size(0):
+         return torch.softmax(next_token_logits, dim=-1)
+-    return torch.softmax(next_token_logits / sampling_info.temperatures, dim=-1)
++    return torch.softmax(next_token_logits / rs_draft_temperatures(sampling_info), dim=-1)
+ 
+ 
+ def sample_draft_proposal(next_token_logits: torch.Tensor, temperatures: torch.Tensor):
 diff --git a/test/manual/test_hybrid_dsa_hicache_gpu.py b/test/manual/test_hybrid_dsa_hicache_gpu.py
 new file mode 100644
 index 0000000000..3186d73ebd

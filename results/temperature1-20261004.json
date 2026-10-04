@@ -1,0 +1,622 @@
+{
+ "date": "2026-10-04",
+ "note": "same session; v18 = adaptive EAGLE 1-5, hot-token map, no rejection sampling; v19 = this release",
+ "spec_t1_bench": {
+  "method": "bench/spec_t1_bench.py: 4 prompts (zh explain / zh code / zh bug finding / ~100K-token document), T=0 once and T=1.0 top_p 0.95 three times each, 512 new tokens, thinking on",
+  "v18": {
+   "T1": {
+    "decode_tok_s": 56.8,
+    "accept": 2.478,
+    "n": 12
+   },
+   "T0": {
+    "decode_tok_s": 61.4,
+    "accept": 2.778,
+    "n": 4
+   },
+   "runs": [
+    {
+     "out": 512,
+     "verify": 200,
+     "accept": 2.56,
+     "ttft": 0.43966150283813477,
+     "decode_tps": 59.47581722837595,
+     "prompt": "zh_explain",
+     "temp": "T0",
+     "rep": 0
+    },
+    {
+     "out": 512,
+     "verify": 227,
+     "accept": 2.2555066079295156,
+     "ttft": 0.5353212356567383,
+     "decode_tps": 56.69412448565889,
+     "prompt": "zh_explain",
+     "temp": "T1",
+     "rep": 0
+    },
+    {
+     "out": 512,
+     "verify": 224,
+     "accept": 2.2857142857142856,
+     "ttft": 0.4525480270385742,
+     "decode_tps": 55.51712044555243,
+     "prompt": "zh_explain",
+     "temp": "T1",
+     "rep": 1
+    },
+    {
+     "out": 512,
+     "verify": 212,
+     "accept": 2.4150943396226414,
+     "ttft": 0.485917329788208,
+     "decode_tps": 56.91663640418698,
+     "prompt": "zh_explain",
+     "temp": "T1",
+     "rep": 2
+    },
+    {
+     "out": 512,
+     "verify": 192,
+     "accept": 2.6666666666666665,
+     "ttft": 0.4320566654205322,
+     "decode_tps": 60.32009022194459,
+     "prompt": "zh_code",
+     "temp": "T0",
+     "rep": 0
+    },
+    {
+     "out": 512,
+     "verify": 225,
+     "accept": 2.2755555555555556,
+     "ttft": 0.4573366641998291,
+     "decode_tps": 53.689105791761435,
+     "prompt": "zh_code",
+     "temp": "T1",
+     "rep": 0
+    },
+    {
+     "out": 512,
+     "verify": 218,
+     "accept": 2.3486238532110093,
+     "ttft": 0.45363306999206543,
+     "decode_tps": 53.957881627153036,
+     "prompt": "zh_code",
+     "temp": "T1",
+     "rep": 1
+    },
+    {
+     "out": 512,
+     "verify": 212,
+     "accept": 2.4150943396226414,
+     "ttft": 0.45816731452941895,
+     "decode_tps": 54.48043066825526,
+     "prompt": "zh_code",
+     "temp": "T1",
+     "rep": 2
+    },
+    {
+     "out": 512,
+     "verify": 175,
+     "accept": 2.9257142857142857,
+     "ttft": 0.6245222091674805,
+     "decode_tps": 63.168716425518824,
+     "prompt": "zh_debug",
+     "temp": "T0",
+     "rep": 0
+    },
+    {
+     "out": 512,
+     "verify": 208,
+     "accept": 2.4615384615384617,
+     "ttft": 0.6144130229949951,
+     "decode_tps": 56.53856893689156,
+     "prompt": "zh_debug",
+     "temp": "T1",
+     "rep": 0
+    },
+    {
+     "out": 512,
+     "verify": 206,
+     "accept": 2.4854368932038833,
+     "ttft": 0.6114277839660645,
+     "decode_tps": 56.75636750662871,
+     "prompt": "zh_debug",
+     "temp": "T1",
+     "rep": 1
+    },
+    {
+     "out": 512,
+     "verify": 206,
+     "accept": 2.4854368932038833,
+     "ttft": 0.6212747097015381,
+     "decode_tps": 57.195123737207155,
+     "prompt": "zh_debug",
+     "temp": "T1",
+     "rep": 2
+    },
+    {
+     "out": 512,
+     "verify": 173,
+     "accept": 2.959537572254335,
+     "ttft": 1.0199644565582275,
+     "decode_tps": 62.59202549741896,
+     "prompt": "long_100k",
+     "temp": "T0",
+     "rep": 0
+    },
+    {
+     "out": 512,
+     "verify": 199,
+     "accept": 2.5728643216080402,
+     "ttft": 0.9742169380187988,
+     "decode_tps": 56.61641484260331,
+     "prompt": "long_100k",
+     "temp": "T1",
+     "rep": 0
+    },
+    {
+     "out": 512,
+     "verify": 178,
+     "accept": 2.8764044943820224,
+     "ttft": 0.961555004119873,
+     "decode_tps": 61.82071028031345,
+     "prompt": "long_100k",
+     "temp": "T1",
+     "rep": 1
+    },
+    {
+     "out": 512,
+     "verify": 179,
+     "accept": 2.8603351955307263,
+     "ttft": 0.964806318283081,
+     "decode_tps": 61.361196507195565,
+     "prompt": "long_100k",
+     "temp": "T1",
+     "rep": 2
+    }
+   ]
+  },
+  "v19": {
+   "T1": {
+    "decode_tok_s": 61.6,
+    "accept": 2.576,
+    "n": 12
+   },
+   "T0": {
+    "decode_tok_s": 61.2,
+    "accept": 2.721,
+    "n": 4
+   },
+   "runs": [
+    {
+     "out": 512,
+     "verify": 210,
+     "accept": 2.4380952380952383,
+     "ttft": 0.380293607711792,
+     "decode_tps": 59.85895703969468,
+     "prompt": "zh_explain",
+     "temp": "T0",
+     "rep": 0
+    },
+    {
+     "out": 512,
+     "verify": 224,
+     "accept": 2.2857142857142856,
+     "ttft": 0.4620234966278076,
+     "decode_tps": 58.216333819490444,
+     "prompt": "zh_explain",
+     "temp": "T1",
+     "rep": 0
+    },
+    {
+     "out": 512,
+     "verify": 222,
+     "accept": 2.3063063063063063,
+     "ttft": 0.3851659297943115,
+     "decode_tps": 59.90537302131776,
+     "prompt": "zh_explain",
+     "temp": "T1",
+     "rep": 1
+    },
+    {
+     "out": 512,
+     "verify": 200,
+     "accept": 2.56,
+     "ttft": 0.4056527614593506,
+     "decode_tps": 63.05102536897815,
+     "prompt": "zh_explain",
+     "temp": "T1",
+     "rep": 2
+    },
+    {
+     "out": 512,
+     "verify": 202,
+     "accept": 2.5346534653465347,
+     "ttft": 0.40972471237182617,
+     "decode_tps": 58.75192731292628,
+     "prompt": "zh_code",
+     "temp": "T0",
+     "rep": 0
+    },
+    {
+     "out": 512,
+     "verify": 205,
+     "accept": 2.497560975609756,
+     "ttft": 0.4103577136993408,
+     "decode_tps": 61.8185384834213,
+     "prompt": "zh_code",
+     "temp": "T1",
+     "rep": 0
+    },
+    {
+     "out": 512,
+     "verify": 208,
+     "accept": 2.4615384615384617,
+     "ttft": 0.41646313667297363,
+     "decode_tps": 61.162560838615846,
+     "prompt": "zh_code",
+     "temp": "T1",
+     "rep": 1
+    },
+    {
+     "out": 512,
+     "verify": 221,
+     "accept": 2.316742081447964,
+     "ttft": 0.4127805233001709,
+     "decode_tps": 58.489973762205544,
+     "prompt": "zh_code",
+     "temp": "T1",
+     "rep": 2
+    },
+    {
+     "out": 512,
+     "verify": 167,
+     "accept": 3.065868263473054,
+     "ttft": 0.613645076751709,
+     "decode_tps": 64.26280689330795,
+     "prompt": "zh_debug",
+     "temp": "T0",
+     "rep": 0
+    },
+    {
+     "out": 512,
+     "verify": 201,
+     "accept": 2.5472636815920398,
+     "ttft": 0.6042850017547607,
+     "decode_tps": 60.44003326544829,
+     "prompt": "zh_debug",
+     "temp": "T1",
+     "rep": 0
+    },
+    {
+     "out": 512,
+     "verify": 191,
+     "accept": 2.680628272251309,
+     "ttft": 0.6055629253387451,
+     "decode_tps": 63.336697851715975,
+     "prompt": "zh_debug",
+     "temp": "T1",
+     "rep": 1
+    },
+    {
+     "out": 512,
+     "verify": 182,
+     "accept": 2.8131868131868134,
+     "ttft": 0.5904645919799805,
+     "decode_tps": 63.32495715062808,
+     "prompt": "zh_debug",
+     "temp": "T1",
+     "rep": 2
+    },
+    {
+     "out": 512,
+     "verify": 180,
+     "accept": 2.8444444444444446,
+     "ttft": 0.9962267875671387,
+     "decode_tps": 61.902257602415126,
+     "prompt": "long_100k",
+     "temp": "T0",
+     "rep": 0
+    },
+    {
+     "out": 512,
+     "verify": 171,
+     "accept": 2.9941520467836256,
+     "ttft": 1.019794225692749,
+     "decode_tps": 65.29795914910362,
+     "prompt": "long_100k",
+     "temp": "T1",
+     "rep": 0
+    },
+    {
+     "out": 512,
+     "verify": 188,
+     "accept": 2.723404255319149,
+     "ttft": 0.9589934349060059,
+     "decode_tps": 61.786150821859636,
+     "prompt": "long_100k",
+     "temp": "T1",
+     "rep": 1
+    },
+    {
+     "out": 512,
+     "verify": 188,
+     "accept": 2.723404255319149,
+     "ttft": 0.9649333953857422,
+     "decode_tps": 62.8472249174754,
+     "prompt": "long_100k",
+     "temp": "T1",
+     "rep": 2
+    }
+   ]
+  }
+ },
+ "workload_14_prompts": {
+  "method": "14 prompts (Chinese / English / code / math / agent), T=1.0 top_p 0.95, 768 new tokens; decode tok/s per request averaged, accept = tokens / verify steps",
+  "v18": {
+   "T1_tok_s": 55.3,
+   "T1_accept": 2.346,
+   "runs": [
+    {
+     "out": 768,
+     "verify": 361,
+     "tps": 52.32088561535677,
+     "prompt": 0,
+     "temp": "T1"
+    },
+    {
+     "out": 768,
+     "verify": 351,
+     "tps": 52.79817902042914,
+     "prompt": 1,
+     "temp": "T1"
+    },
+    {
+     "out": 768,
+     "verify": 282,
+     "tps": 60.30779073500594,
+     "prompt": 2,
+     "temp": "T1"
+    },
+    {
+     "out": 768,
+     "verify": 322,
+     "tps": 55.36795120273704,
+     "prompt": 3,
+     "temp": "T1"
+    },
+    {
+     "out": 768,
+     "verify": 332,
+     "tps": 53.87038592558122,
+     "prompt": 4,
+     "temp": "T1"
+    },
+    {
+     "out": 768,
+     "verify": 346,
+     "tps": 55.70400580645866,
+     "prompt": 5,
+     "temp": "T1"
+    },
+    {
+     "out": 768,
+     "verify": 347,
+     "tps": 53.29368017127366,
+     "prompt": 6,
+     "temp": "T1"
+    },
+    {
+     "out": 768,
+     "verify": 381,
+     "tps": 49.68567309812669,
+     "prompt": 7,
+     "temp": "T1"
+    },
+    {
+     "out": 768,
+     "verify": 299,
+     "tps": 57.63842602862318,
+     "prompt": 8,
+     "temp": "T1"
+    },
+    {
+     "out": 768,
+     "verify": 368,
+     "tps": 50.68797374952468,
+     "prompt": 9,
+     "temp": "T1"
+    },
+    {
+     "out": 768,
+     "verify": 234,
+     "tps": 68.35307606153349,
+     "prompt": 10,
+     "temp": "T1"
+    },
+    {
+     "out": 768,
+     "verify": 397,
+     "tps": 46.962633419410224,
+     "prompt": 11,
+     "temp": "T1"
+    },
+    {
+     "out": 768,
+     "verify": 327,
+     "tps": 55.676425113164655,
+     "prompt": 12,
+     "temp": "T1"
+    },
+    {
+     "out": 768,
+     "verify": 332,
+     "tps": 55.16568034461051,
+     "prompt": 13,
+     "temp": "T1"
+    },
+    {
+     "out": 768,
+     "verify": 236,
+     "tps": 67.00358014759598,
+     "prompt": 1,
+     "temp": "T0"
+    },
+    {
+     "out": 768,
+     "verify": 307,
+     "tps": 57.03251559390732,
+     "prompt": 6,
+     "temp": "T0"
+    },
+    {
+     "out": 768,
+     "verify": 277,
+     "tps": 58.91164434046242,
+     "prompt": "long",
+     "temp": "T1"
+    },
+    {
+     "out": 768,
+     "verify": 282,
+     "tps": 58.612977286661945,
+     "prompt": "long",
+     "temp": "T1"
+    }
+   ]
+  },
+  "v19": {
+   "T1_tok_s": 61.0,
+   "T1_accept": 2.504,
+   "runs": [
+    {
+     "out": 768,
+     "verify": 340,
+     "tps": 58.12561624390884,
+     "prompt": 0,
+     "temp": "T1"
+    },
+    {
+     "out": 768,
+     "verify": 327,
+     "tps": 58.65833528236239,
+     "prompt": 1,
+     "temp": "T1"
+    },
+    {
+     "out": 768,
+     "verify": 253,
+     "tps": 69.41632865104557,
+     "prompt": 2,
+     "temp": "T1"
+    },
+    {
+     "out": 768,
+     "verify": 300,
+     "tps": 60.577482311998466,
+     "prompt": 3,
+     "temp": "T1"
+    },
+    {
+     "out": 768,
+     "verify": 293,
+     "tps": 63.11738322612442,
+     "prompt": 4,
+     "temp": "T1"
+    },
+    {
+     "out": 768,
+     "verify": 321,
+     "tps": 61.207331901408935,
+     "prompt": 5,
+     "temp": "T1"
+    },
+    {
+     "out": 768,
+     "verify": 321,
+     "tps": 58.933150816367366,
+     "prompt": 6,
+     "temp": "T1"
+    },
+    {
+     "out": 768,
+     "verify": 364,
+     "tps": 54.20812699508239,
+     "prompt": 7,
+     "temp": "T1"
+    },
+    {
+     "out": 768,
+     "verify": 306,
+     "tps": 61.18479718016323,
+     "prompt": 8,
+     "temp": "T1"
+    },
+    {
+     "out": 768,
+     "verify": 373,
+     "tps": 53.40447344537672,
+     "prompt": 9,
+     "temp": "T1"
+    },
+    {
+     "out": 768,
+     "verify": 252,
+     "tps": 65.87111230598462,
+     "prompt": 10,
+     "temp": "T1"
+    },
+    {
+     "out": 768,
+     "verify": 296,
+     "tps": 60.88611218270093,
+     "prompt": 11,
+     "temp": "T1"
+    },
+    {
+     "out": 768,
+     "verify": 284,
+     "tps": 64.75182333893154,
+     "prompt": 12,
+     "temp": "T1"
+    },
+    {
+     "out": 768,
+     "verify": 315,
+     "tps": 61.668245955272226,
+     "prompt": 13,
+     "temp": "T1"
+    },
+    {
+     "out": 768,
+     "verify": 285,
+     "tps": 62.00267724850858,
+     "prompt": 1,
+     "temp": "T0"
+    },
+    {
+     "out": 768,
+     "verify": 320,
+     "tps": 58.368183076845426,
+     "prompt": 6,
+     "temp": "T0"
+    },
+    {
+     "out": 768,
+     "verify": 298,
+     "tps": 59.58587216174098,
+     "prompt": "long",
+     "temp": "T1"
+    },
+    {
+     "out": 768,
+     "verify": 264,
+     "tps": 64.73337107967978,
+     "prompt": "long",
+     "temp": "T1"
+    }
+   ]
+  }
+ }
+}

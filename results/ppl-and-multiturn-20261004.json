@@ -1,0 +1,110 @@
+{
+ "date": "2026-10-04",
+ "ppl": {
+  "method": "bench/ppl_eval.py --tokens 4096 --segments 6 (13 segments: docs, agent sessions, Chinese doc)",
+  "runs": {
+   "lsglang_glm5.3-v19-1": {
+    "docs": {
+     "segments": 6,
+     "nll": 1.4987,
+     "ppl": 4.4759
+    },
+    "agent": {
+     "segments": 6,
+     "nll": 1.18118,
+     "ppl": 3.2582
+    },
+    "zh": {
+     "segments": 1,
+     "nll": 2.17232,
+     "ppl": 8.7786
+    },
+    "all": {
+     "segments": 13,
+     "nll": 1.40397,
+     "ppl": 4.0713
+    }
+   },
+   "lsglang_glm5.3-v19-2": {
+    "docs": {
+     "segments": 6,
+     "nll": 1.49863,
+     "ppl": 4.4755
+    },
+    "agent": {
+     "segments": 6,
+     "nll": 1.18002,
+     "ppl": 3.2544
+    },
+    "zh": {
+     "segments": 1,
+     "nll": 2.17112,
+     "ppl": 8.7681
+    },
+    "all": {
+     "segments": 13,
+     "nll": 1.40331,
+     "ppl": 4.0686
+    }
+   },
+   "lsglang_glm5.3-v19-3": {
+    "docs": {
+     "segments": 6,
+     "nll": 1.49912,
+     "ppl": 4.4778
+    },
+    "agent": {
+     "segments": 6,
+     "nll": 1.18057,
+     "ppl": 3.2562
+    },
+    "zh": {
+     "segments": 1,
+     "nll": 2.16663,
+     "ppl": 8.7288
+    },
+    "all": {
+     "segments": 13,
+     "nll": 1.40345,
+     "ppl": 4.0692
+    }
+   },
+   "lsglang_glm5.3-v19-4": {
+    "docs": {
+     "segments": 6,
+     "nll": 1.49864,
+     "ppl": 4.4756
+    },
+    "agent": {
+     "segments": 6,
+     "nll": 1.18047,
+     "ppl": 3.2559
+    },
+    "zh": {
+     "segments": 1,
+     "nll": 2.17362,
+     "ppl": 8.79
+    },
+    "all": {
+     "segments": 13,
+     "nll": 1.40371,
+     "ppl": 4.0703
+    }
+   }
+  },
+  "mean_all": 4.0698,
+  "previous_v18_mean_all": 4.0719
+ },
+ "multi_turn_decode": {
+  "method": "bench/spec_bench.py PORT TAG 2 (6 prompts x 2 rounds, max 700 tokens, temp 0)",
+  "lsglang_glm53_tok_s": [
+   63.19
+  ],
+  "previous_v18_tok_s": [
+   61.66
+  ],
+  "closed_lk_moe_tok_s": [
+   38.77
+  ]
+ }
+}

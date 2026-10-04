@@ -21,7 +21,7 @@ cd "$LSGLANG"
 exec env \
   LKQMOE_MODE=standalone \
   LKQMOE_LIBRARY="$lkq/liblkqmoe.so" \
-  LKQMOE_STATS_DIR="$STATS_DIR" LKQMOE_ORIGINAL_WARMUP=0 LKQMOE_ZERO_COPY=1 LKQMOE_SPIN_COUNT=1048576 \
+  LKQMOE_STATS_DIR="$STATS_DIR" LKQMOE_ORIGINAL_WARMUP=0 LKQMOE_ZERO_COPY=1 LKQMOE_SPIN_COUNT=1048576 LKQMOE_ACTIVE_FLAGS=1 \
   LKQMOE_THREADS=112 LKQMOE_DYNAMIC=2 LKQMOE_DOWN_BF16=1 \
   LKQMOE_MAIN_CPUS=76-79,92-94,108-111,124-127 LKQMOE_PROBE_DISPATCH_CPU=95 \
   LVLLM_GPU_PREFILL_MIN_BATCH_SIZE=512 LKQMOE_RUNTIME_FILE="$REPO/launch/lkqmoe-runtime.json" \
@@ -36,6 +36,8 @@ exec env \
   'LKQMOE_PREFILL_W4A4_INCLUDE=[.](self_attn|mlp)[.]|eh_proj' \
   LKQMOE_GLM53_MHC=1 LKQMOE_SMALL_M_GEMM=1 LKQMOE_INDEXER_Q_CHUNK=4096 LKQMOE_GLM53_CPU_IMAGE=1 \
   SGLANG_MHC_PRE_TRITON=1 SGLANG_MHC_POST_TRITON=1 \
+  SGLANG_RS_DRAFT_TEMP_SCALE=0.8 SGLANG_SPEC_TRUNCATE_Q=0.2 \
+  SGLANG_EXPERIMENTAL_DSA_KPOOL_METADATA_FUSION=1 SGLANG_EXPERIMENTAL_DSA_INGRAPH_VERIFY_METADATA=1 \
   SGLANG_OPT_USE_TILELANG_MHC_PRE=0 SGLANG_OPT_USE_TILELANG_MHC_POST=0 \
   PYTHONPATH="$lkq/python:$LSGLANG/python" \
   CUDA_HOME="$cuda_root" PATH="$cuda_root/bin:$PATH" \
@@ -74,4 +76,5 @@ exec env \
     --speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-eagle-topk 1 \
     --speculative-num-draft-tokens 4 --speculative-adaptive \
     --speculative-adaptive-config "$REPO/launch/adaptive-steps-1to5.json" \
-    --speculative-token-map "$lkq/draft-token-map-49152.pt"
+    --speculative-token-map "$lkq/draft-token-map-49152.pt" \
+    --speculative-use-rejection-sampling
