@@ -62,8 +62,8 @@ decoding with lossless rejection sampling, ~61 tok/s decode at temperature 1.0, 
 | 413,125 | 162.45 s | 2,543 | 65.9 | 3.35 | 是 | 70,944 MiB |
 | 514,559 | 204.00 s | 2,522 | 67.0 | 3.36 | 是 | 70,944 MiB |
 
-- 多轮对话（`bench/spec_bench.py`，6 条提示 × 2 轮，每条最多 700 token，温度 0，总输出 token ÷ 总耗时）：63.19 tok/s（上一版 61.66，原版 38.77）。
-- 精度：困惑度（`bench/ppl_eval.py`，13 段 × 4096 token，中英文文档与代理会话）4 次平均 4.0698（每次 4.0686–4.0713；上一版 4.0719）；原版 4.0517（2 次），高约 0.45%，主要来自预填充时 GPU 常驻层的 W4A4 与 CPU 专家的 BF16 中间值。
+- 多轮对话（`bench/spec_bench.py`，6 条提示 × 2 轮，每条最多 700 token，温度 0，总输出 token ÷ 总耗时）：63.19 tok/s（上一版 61.66）。
+- 精度：困惑度（`bench/ppl_eval.py`，13 段 × 4096 token，中英文文档与代理会话）4 次平均 4.0698（每次 4.0686–4.0713；上一版 4.0719）。
 - decode 速度随生成内容变化较大：同一提示两次运行的接受长度可以差 0.4，自适应草稿随之改变每步验证的 token 数，单点 decode
   相差 ±10% 很常见（例如 514K 同一提示 62.0 / 63.2 tok/s），比较时看多点平均或固定草稿步数下的每步耗时。困惑度与多轮测速的原始数据
   `results/ppl-and-multiturn-20261004.json`（上一版 `-20261003.json`）。
@@ -81,7 +81,7 @@ decoding with lossless rejection sampling, ~61 tok/s decode at temperature 1.0, 
 - KV 缓存 FP8；单请求并发；图片在 CPU 上解码与预处理（`--image-processor-backend pil`）。
 - EAGLE（NextN）：自适应草稿步数（候选 1–5 步，`launch/adaptive-steps-1to5.json`），草稿热词表 49152。
 - 拒绝采样（`--speculative-use-rejection-sampling`，Leviathan 式，无损）：草稿按 softmax(logits / T) 采样，验证时以
-  coin·q(x) < p(x) 接受，拒绝时从 (p − q)⁺ 补采，输出分布与不用投机解码相同。原版 sglang 要求草稿与主模型词表一致，
+  coin·q(x) < p(x) 接受，拒绝时从 (p − q)⁺ 补采，输出分布与不用投机解码相同。上游 sglang 要求草稿与主模型词表一致，
   本补丁把只覆盖高频词表的草稿分布 q 在验证前填回完整词表（表外 q = 0），两者可以同时用；贪心请求（温度 0，sglang 内部是
   top_k = 1）草稿直接取 argmax，温度 0 的接受率不受影响。
 - 草稿温度 = 请求温度 × 0.8（`SGLANG_RS_DRAFT_TEMP_SCALE`）：对任意草稿分布都无损，0.8 时期望接受最高；系数是用验证时
