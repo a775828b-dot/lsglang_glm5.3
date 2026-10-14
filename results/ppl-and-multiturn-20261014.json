@@ -1,0 +1,107 @@
+{
+ "date": "2026-10-14",
+ "ppl": {
+  "method": "bench/ppl_eval.py --tokens 4096 --segments 6 (13 segments: docs, agent sessions, Chinese doc)",
+  "runs": {
+   "lsglang_glm5.3-lkqstrata-1": {
+    "docs": {
+     "segments": 6,
+     "nll": 1.48717,
+     "ppl": 4.4245
+    },
+    "agent": {
+     "segments": 6,
+     "nll": 1.18669,
+     "ppl": 3.2762
+    },
+    "zh": {
+     "segments": 1,
+     "nll": 2.16775,
+     "ppl": 8.7386
+    },
+    "all": {
+     "segments": 13,
+     "nll": 1.40084,
+     "ppl": 4.0586
+    }
+   },
+   "lsglang_glm5.3-lkqstrata-2": {
+    "docs": {
+     "segments": 6,
+     "nll": 1.48638,
+     "ppl": 4.421
+    },
+    "agent": {
+     "segments": 6,
+     "nll": 1.18585,
+     "ppl": 3.2735
+    },
+    "zh": {
+     "segments": 1,
+     "nll": 2.17156,
+     "ppl": 8.772
+    },
+    "all": {
+     "segments": 13,
+     "nll": 1.40038,
+     "ppl": 4.0567
+    }
+   },
+   "lsglang_glm5.3-lkqstrata-3": {
+    "docs": {
+     "segments": 6,
+     "nll": 1.48639,
+     "ppl": 4.4211
+    },
+    "agent": {
+     "segments": 6,
+     "nll": 1.1876,
+     "ppl": 3.2792
+    },
+    "zh": {
+     "segments": 1,
+     "nll": 2.16729,
+     "ppl": 8.7346
+    },
+    "all": {
+     "segments": 13,
+     "nll": 1.40086,
+     "ppl": 4.0587
+    }
+   },
+   "lsglang_glm5.3-lkqstrata-4": {
+    "docs": {
+     "segments": 6,
+     "nll": 1.48683,
+     "ppl": 4.4231
+    },
+    "agent": {
+     "segments": 6,
+     "nll": 1.18655,
+     "ppl": 3.2758
+    },
+    "zh": {
+     "segments": 1,
+     "nll": 2.16924,
+     "ppl": 8.7516
+    },
+    "all": {
+     "segments": 13,
+     "nll": 1.40073,
+     "ppl": 4.0582
+    }
+   }
+  },
+  "mean_all": 4.058,
+  "previous_v19_mean_all": 4.0698
+ },
+ "multi_turn_decode": {
+  "method": "bench/spec_bench.py PORT TAG 2 (6 prompts x 2 rounds, max 700 tokens, temp 0)",
+  "lsglang_glm53_tok_s": [
+   78.23
+  ],
+  "previous_v19_tok_s": [
+   63.19
+  ]
+ }
+}

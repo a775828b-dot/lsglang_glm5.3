@@ -1,0 +1,355 @@
+{
+ "date": "2026-10-14",
+ "note": "same session; v19 = 9 GPU-resident MoE layers (3-11), lkqmoe 0.4.3; lkqstrata = this release: all 42 MoE layers on lkqmoe 0.5.0 with the LKQstrata expert pool (62 slots per layer, adaptive), run from the compiled lkqmoe/ of this repository",
+ "spec_t1_bench": {
+  "method": "bench/spec_t1_bench.py: 4 prompts (zh explain / zh code / zh bug finding / ~100K-token document), T=0 once and T=1.0 top_p 0.95 three times each, 512 new tokens, thinking on",
+  "v19": {
+   "T1": {
+    "decode_tok_s": 62.5,
+    "accept": 2.641,
+    "n": 12
+   },
+   "T0": {
+    "decode_tok_s": 62.8,
+    "accept": 2.822,
+    "n": 4
+   },
+   "runs": [
+    {
+     "out": 512,
+     "verify": 212,
+     "accept": 2.4150943396226414,
+     "ttft": 0.37824583053588867,
+     "decode_tps": 59.94748447827081,
+     "prompt": "zh_explain",
+     "temp": "T0",
+     "rep": 0
+    },
+    {
+     "out": 512,
+     "verify": 223,
+     "accept": 2.295964125560538,
+     "ttft": 0.4494740962982178,
+     "decode_tps": 60.0528383547923,
+     "prompt": "zh_explain",
+     "temp": "T1",
+     "rep": 0
+    },
+    {
+     "out": 512,
+     "verify": 195,
+     "accept": 2.6256410256410256,
+     "ttft": 0.3759887218475342,
+     "decode_tps": 63.0737273532837,
+     "prompt": "zh_explain",
+     "temp": "T1",
+     "rep": 1
+    },
+    {
+     "out": 512,
+     "verify": 216,
+     "accept": 2.3703703703703702,
+     "ttft": 0.4047262668609619,
+     "decode_tps": 59.588481397252714,
+     "prompt": "zh_explain",
+     "temp": "T1",
+     "rep": 2
+    },
+    {
+     "out": 512,
+     "verify": 198,
+     "accept": 2.585858585858586,
+     "ttft": 0.3883507251739502,
+     "decode_tps": 59.87975945946633,
+     "prompt": "zh_code",
+     "temp": "T0",
+     "rep": 0
+    },
+    {
+     "out": 512,
+     "verify": 213,
+     "accept": 2.403755868544601,
+     "ttft": 0.4046590328216553,
+     "decode_tps": 58.69600891993165,
+     "prompt": "zh_code",
+     "temp": "T1",
+     "rep": 0
+    },
+    {
+     "out": 512,
+     "verify": 190,
+     "accept": 2.694736842105263,
+     "ttft": 0.39205312728881836,
+     "decode_tps": 63.2858161468954,
+     "prompt": "zh_code",
+     "temp": "T1",
+     "rep": 1
+    },
+    {
+     "out": 512,
+     "verify": 216,
+     "accept": 2.3703703703703702,
+     "ttft": 0.39617395401000977,
+     "decode_tps": 58.21184174839442,
+     "prompt": "zh_code",
+     "temp": "T1",
+     "rep": 2
+    },
+    {
+     "out": 512,
+     "verify": 153,
+     "accept": 3.34640522875817,
+     "ttft": 0.6108767986297607,
+     "decode_tps": 68.22030113589452,
+     "prompt": "zh_debug",
+     "temp": "T0",
+     "rep": 0
+    },
+    {
+     "out": 512,
+     "verify": 196,
+     "accept": 2.6122448979591835,
+     "ttft": 0.6122426986694336,
+     "decode_tps": 61.97256428872286,
+     "prompt": "zh_debug",
+     "temp": "T1",
+     "rep": 0
+    },
+    {
+     "out": 512,
+     "verify": 170,
+     "accept": 3.011764705882353,
+     "ttft": 0.6070139408111572,
+     "decode_tps": 66.35575244045057,
+     "prompt": "zh_debug",
+     "temp": "T1",
+     "rep": 1
+    },
+    {
+     "out": 512,
+     "verify": 197,
+     "accept": 2.598984771573604,
+     "ttft": 0.6052350997924805,
+     "decode_tps": 61.73796724406197,
+     "prompt": "zh_debug",
+     "temp": "T1",
+     "rep": 2
+    },
+    {
+     "out": 512,
+     "verify": 174,
+     "accept": 2.942528735632184,
+     "ttft": 1.0262305736541748,
+     "decode_tps": 63.131951353427574,
+     "prompt": "long_100k",
+     "temp": "T0",
+     "rep": 0
+    },
+    {
+     "out": 512,
+     "verify": 164,
+     "accept": 3.1219512195121952,
+     "ttft": 1.111196756362915,
+     "decode_tps": 68.1400786147056,
+     "prompt": "long_100k",
+     "temp": "T1",
+     "rep": 0
+    },
+    {
+     "out": 512,
+     "verify": 195,
+     "accept": 2.6256410256410256,
+     "ttft": 1.01993989944458,
+     "decode_tps": 62.678277612370664,
+     "prompt": "long_100k",
+     "temp": "T1",
+     "rep": 1
+    },
+    {
+     "out": 512,
+     "verify": 173,
+     "accept": 2.959537572254335,
+     "ttft": 0.9710066318511963,
+     "decode_tps": 66.2309224453148,
+     "prompt": "long_100k",
+     "temp": "T1",
+     "rep": 2
+    }
+   ]
+  },
+  "lkqstrata": {
+   "T1": {
+    "decode_tok_s": 83.3,
+    "accept": 2.783,
+    "n": 12
+   },
+   "T0": {
+    "decode_tok_s": 79.9,
+    "accept": 2.913,
+    "n": 4
+   },
+   "runs": [
+    {
+     "out": 512,
+     "verify": 184,
+     "accept": 2.782608695652174,
+     "ttft": 0.4307739734649658,
+     "decode_tps": 80.60514459919528,
+     "prompt": "zh_explain",
+     "temp": "T0",
+     "rep": 0
+    },
+    {
+     "out": 512,
+     "verify": 209,
+     "accept": 2.449760765550239,
+     "ttft": 0.482741117477417,
+     "decode_tps": 79.46360830048657,
+     "prompt": "zh_explain",
+     "temp": "T1",
+     "rep": 0
+    },
+    {
+     "out": 512,
+     "verify": 208,
+     "accept": 2.4615384615384617,
+     "ttft": 0.4237861633300781,
+     "decode_tps": 79.1892669467832,
+     "prompt": "zh_explain",
+     "temp": "T1",
+     "rep": 1
+    },
+    {
+     "out": 512,
+     "verify": 211,
+     "accept": 2.4265402843601898,
+     "ttft": 0.4220583438873291,
+     "decode_tps": 79.28437749302388,
+     "prompt": "zh_explain",
+     "temp": "T1",
+     "rep": 2
+    },
+    {
+     "out": 512,
+     "verify": 188,
+     "accept": 2.723404255319149,
+     "ttft": 0.44726133346557617,
+     "decode_tps": 72.78609262187554,
+     "prompt": "zh_code",
+     "temp": "T0",
+     "rep": 0
+    },
+    {
+     "out": 512,
+     "verify": 181,
+     "accept": 2.8287292817679557,
+     "ttft": 0.4348256587982178,
+     "decode_tps": 82.85896289042014,
+     "prompt": "zh_code",
+     "temp": "T1",
+     "rep": 0
+    },
+    {
+     "out": 512,
+     "verify": 190,
+     "accept": 2.694736842105263,
+     "ttft": 0.4659895896911621,
+     "decode_tps": 80.31680435785191,
+     "prompt": "zh_code",
+     "temp": "T1",
+     "rep": 1
+    },
+    {
+     "out": 512,
+     "verify": 156,
+     "accept": 3.282051282051282,
+     "ttft": 0.4592247009277344,
+     "decode_tps": 89.07896900462059,
+     "prompt": "zh_code",
+     "temp": "T1",
+     "rep": 2
+    },
+    {
+     "out": 512,
+     "verify": 155,
+     "accept": 3.303225806451613,
+     "ttft": 0.7299942970275879,
+     "decode_tps": 84.41215771119312,
+     "prompt": "zh_debug",
+     "temp": "T0",
+     "rep": 0
+    },
+    {
+     "out": 512,
+     "verify": 174,
+     "accept": 2.942528735632184,
+     "ttft": 0.7203967571258545,
+     "decode_tps": 92.00927850337813,
+     "prompt": "zh_debug",
+     "temp": "T1",
+     "rep": 0
+    },
+    {
+     "out": 512,
+     "verify": 180,
+     "accept": 2.8444444444444446,
+     "ttft": 0.702268123626709,
+     "decode_tps": 82.48734007583039,
+     "prompt": "zh_debug",
+     "temp": "T1",
+     "rep": 1
+    },
+    {
+     "out": 512,
+     "verify": 173,
+     "accept": 2.959537572254335,
+     "ttft": 0.7208812236785889,
+     "decode_tps": 83.93380893581325,
+     "prompt": "zh_debug",
+     "temp": "T1",
+     "rep": 2
+    },
+    {
+     "out": 512,
+     "verify": 180,
+     "accept": 2.8444444444444446,
+     "ttft": 1.1795198917388916,
+     "decode_tps": 81.62177379509508,
+     "prompt": "long_100k",
+     "temp": "T0",
+     "rep": 0
+    },
+    {
+     "out": 512,
+     "verify": 186,
+     "accept": 2.752688172043011,
+     "ttft": 1.164632797241211,
+     "decode_tps": 81.93755679517008,
+     "prompt": "long_100k",
+     "temp": "T1",
+     "rep": 0
+    },
+    {
+     "out": 512,
+     "verify": 189,
+     "accept": 2.708994708994709,
+     "ttft": 1.157212257385254,
+     "decode_tps": 81.90444444164206,
+     "prompt": "long_100k",
+     "temp": "T1",
+     "rep": 1
+    },
+    {
+     "out": 512,
+     "verify": 168,
+     "accept": 3.0476190476190474,
+     "ttft": 1.1493282318115234,
+     "decode_tps": 86.92583388359327,
+     "prompt": "long_100k",
+     "temp": "T1",
+     "rep": 2
+    }
+   ]
+  }
+ }
+}

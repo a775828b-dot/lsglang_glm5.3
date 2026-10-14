@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # GLM-5.3 Flash NVFP4 + EAGLE (NextN) on one RTX PRO 5000 72GB (SM120) + 2x EPYC 9334 (4 NUMA nodes).
-# MoE layers 3-11 on the GPU; routed experts of the other 33 MoE layers run on lkqmoe (compiled, ../lkqmoe).
-# This is the launch used for the measurements in README.md; edit the paths block first.
+# Routed experts of all 42 MoE layers run on lkqmoe (compiled, ../lkqmoe); the GPU keeps the hot experts of every
+# layer in the LKQstrata expert pool (62 slots per layer, adaptive). This is the launch used for the measurements in
+# README.md; edit the paths block first.
+#   previous layout (MoE layers 3-11 resident on the GPU, no pool):  RESIDENT=0,3-11 LKQSTRATA=0
+#   mixed (layers 3-5 resident + pool on the others, same VRAM):      RESIDENT=0,3-5 LKQSTRATA_SLOTS=44
 set -Eeuo pipefail
 
 # ---- paths ------------------------------------------------------------------------------
@@ -11,6 +14,9 @@ VENV=${VENV:-$LSGLANG/env}            # python 3.12, see README "环境搭建"
 MODEL=${MODEL:-/models/LibertAIDAI/GLM-5.3-Flash-NVFP4}
 PORT=${PORT:-18085}
 STATS_DIR=${STATS_DIR:-$REPO/run/lkqmoe-stats}
+RESIDENT=${RESIDENT:-0}                # GPU-resident MoE layers ("0" = only the NextN draft layer)
+LKQSTRATA=${LKQSTRATA:-1}              # LKQstrata expert pool on the lkqmoe layers
+LKQSTRATA_SLOTS=${LKQSTRATA_SLOTS:-62} # expert slots per lkqmoe layer (62 x 42 layers ~ 34.3 GiB)
 
 cuda_root="$VENV/lib/python3.12/site-packages/nvidia/cu13"
 lkq="$REPO/lkqmoe"
@@ -30,7 +36,7 @@ exec env \
   LKQMOE_PREFILL_EXPERT_CHUNK=16 LKQMOE_PREFILL_ROUTE_ACCUM=1 LKQMOE_PREFILL_PREFETCH_CHUNKS=12 \
   LKQMOE_PREFILL_TILE_M=64 LKQMOE_GATE_BN=128 LKQMOE_DOWN_BN=128 LKQMOE_DOWN_BK=64 \
   LKQMOE_GATE_LAUNCH=8,3 LKQMOE_DOWN_LAUNCH=8,3 LKQMOE_DOWN_PRECISION=bf16 \
-  LVLLM_GPU_RESIDENT_MOE_LAYERS=0,3-11 LKQMOE_RESIDENT_W4A16=1 LKQMOE_RESIDENT_W4A16_SKIP_DRAFT=1 \
+  LVLLM_GPU_RESIDENT_MOE_LAYERS="$RESIDENT" LKQMOE_RESIDENT_W4A16=1 LKQMOE_RESIDENT_W4A16_SKIP_DRAFT=1   LKQSTRATA="$LKQSTRATA" LKQSTRATA_SLOTS="$LKQSTRATA_SLOTS" LKQSTRATA_PROFILE="$lkq/lkqstrata-glm53.json" \
   LKQMOE_FP8_WEIGHTS=1 'LKQMOE_FP8_INCLUDE=[.](self_attn|mlp)[.]|eh_proj' \
   'LKQMOE_FP8_EXCLUDE=(fused_qkv_a_proj|kv_b_proj|[.]gate$|visual|vision|weights_proj)' \
   'LKQMOE_PREFILL_W4A4_INCLUDE=[.](self_attn|mlp)[.]|eh_proj' \
