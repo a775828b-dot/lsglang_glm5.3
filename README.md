@@ -78,6 +78,17 @@ image input) on guqiong96/Lsglang, with the CPU-side routed experts on lkqmoe, a
 - decode 速度随生成内容变化较大：同一提示两次运行的接受长度可以差 0.4，自适应草稿随之改变每步验证的 token 数，单点 decode
   相差 ±10% 很常见，比较时看多点平均或同一时段的 A/B。
 
+**并发**（短提示，温度 1.0，每个请求 512 token，同时开始；两版同日同方法测得）：
+
+| 并发 | 上一版（9 层常驻）单请求 / 总吞吐 | 本版（LKQstrata）单请求 / 总吞吐 | 总吞吐 |
+|---:|---:|---:|---:|
+| 1 | 60.8 / 60.9 tok/s | 78.0 / 78.1 | +28% |
+| 2 | 39.4 / 77.9 | 51.5 / 101.6 | +30% |
+
+2 并发配置：`--max-running-requests 2 --max-mamba-cache-size 10`（每个请求占 5 个 mamba 状态槽），热专家池改为
+`LKQSTRATA_SLOTS=60`（省出的显存给 mamba 槽与 bs=2 的 CUDA graph），512K 上下文不变（单个 514K 输入显存峰值 70,888 MiB）。
+长输入预填充期间，另一个请求的预填充需排队等它完成。
+
 ### 上一版：温度 1.0 改进（2026-10-04，v18 → v19）
 
 同一时段对比 v18（自适应 EAGLE + 高频词表，不用拒绝采样）与 v19（`results/temperature1-20261004.json`）：
