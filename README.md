@@ -158,6 +158,7 @@ SGLANG_EXPERIMENTAL_DSA_KPOOL_METADATA_FUSION=1  SGLANG_EXPERIMENTAL_DSA_INGRAPH
   LKQstrata 热专家池 `pool.pyc`）、
   `python/lkqmoe/gpu/small_gemm.pyc`（decode 小批量 BF16 GEMM）；含 Triton 内核的模块内嵌压缩源码，因为 Triton 编译时要读源码。
   许可见 `lkqmoe/LICENSE`：可免费使用、原样再分发。
+- 版本 0.5.2（2026-10-16）：CPU 内核按 NUMA 拓扑自动分配——从系统读取每个有 CPU 的 NUMA 节点（本机 NPS2 为 4 个、NPS4 为 8 个），每个节点存每个专家 1/N 的行，线程先用该节点的物理核、再用其 SMT 兄弟线程，不再写死 4 节点 × 16 核。`LKQMOE_MAIN_CPUS=auto` 自动取“允许的 CPU − 专家线程 − 信箱调度线程”，换拓扑或线程数不用手改列表。本机（NPS2）上绑核与 0.5.0 完全相同；三个模型的实权重单层在 64 / 112 线程、默认与生产开关、m = 1…2048 下输出与 0.5.0 逐位相同，速度持平；在本机把每个节点拆成两半模拟 NPS4 的 8 节点布局，输出同样逐位相同。启动日志会打印 `[lkqmoe] N worker nodes ...`。
 - 版本 0.5.0（2026-10-14）：LKQstrata 热专家池。默认关闭，关闭时与 0.4.3 逐位相同（`liblkqmoe.so` 不变）。开关：
   `LKQSTRATA=1`；`LKQSTRATA_SLOTS`（每层槽位，GLM-5.3 用 62 = 上一版 9 个常驻层的显存；保留 3 层常驻时 44）；
   `LKQSTRATA_PROFILE`（排名表，按模型层号取行，任意常驻层组合都能用）；`LKQSTRATA_ADAPT`（自适应，默认 1）与
@@ -178,7 +179,7 @@ SGLANG_EXPERIMENTAL_DSA_KPOOL_METADATA_FUSION=1  SGLANG_EXPERIMENTAL_DSA_INGRAPH
   - `indexer_chunk.py`：DSA 索引器预填充 logits 分块，512K 不再 OOM。
   - `glm53_cpu_image.py`：图片解码放 CPU（GPU 解码只多占显存再拷回 CPU）。
 - 精度：CPU 专家 BF16 Down（单层对 FP64 相对误差约 1.5e-3）；GPU 预填充对 FP64 误差 2.3e-3。
-- 硬件要求：x86-64 AVX512-BF16（VBMI 更快），4 个 NUMA 节点 × 16 物理核（其他拓扑未验证），SM120 GPU（`resident_w4a16.py` 的
+- 硬件要求：x86-64 AVX512-BF16（VBMI 更快），NUMA 拓扑自动识别（已验证 NPS2 的 4 节点 × 16 核，NPS4 的 8 节点 × 8 核在本机模拟验证；hidden / intermediate 须是 16 × 节点数的倍数）。启动脚本里的 `LKQMOE_MAIN_CPUS` 列表按本机 NPS2 写好，换到其他拓扑时改成 `auto`，SM120 GPU（`resident_w4a16.py` 的
   硬件 FP4 转换需要 sm_100a / sm_120a）。
 
 ## 测试脚本（`bench/`）
