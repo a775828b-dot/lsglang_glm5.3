@@ -8,7 +8,8 @@ GLM-5.3 Flash NVFP4 单卡推理管线：一张 RTX PRO 5000 72GB + 双路 EPYC�
 
 *English: a single-GPU GLM-5.3 Flash NVFP4 pipeline (RTX PRO 5000 72GB + 2x EPYC 9334, 512K context, EAGLE/NextN speculative
 decoding with lossless rejection sampling, LKQstrata GPU expert pool for the hot experts of every MoE layer, ~83 tok/s decode at temperature 1.0,
-image input) on guqiong96/Lsglang, with the CPU-side routed experts on lkqmoe, an NVFP4-specialised MoE kernel inspired by lk_moe
+image input; lkqmoe 0.5.3 also runs on AVX2-only CPUs and with tensor parallelism, tested with TP=2 on 2x RTX 5070 Ti 16GB
+and 2x EPYC 7642 at 256K context) on guqiong96/Lsglang, with the CPU-side routed experts on lkqmoe, an NVFP4-specialised MoE kernel inspired by lk_moe
 (by guqiong96, the author of lsglang); a compiled, closed-source build is included here.*
 
 ## 组成
@@ -22,6 +23,7 @@ image input) on guqiong96/Lsglang, with the CPU-side routed experts on lkqmoe, a
 | GPU 侧补丁 | 开源：mHC 融合、BF16 权重转 FP8（W8A16 decode / W8A8 预填充）、GPU 常驻 MoE 层 W4A16 decode、DSA 索引器分块预填充、图片 CPU 预处理 | `lkqmoe/python/lkqmoe/gpu/` |
 | 草稿热词表 | 从 GLM 实际输出、代理会话与文档统计的 49152 个高频 token（词表 154880；只影响草稿接受率，目标模型仍验证每个 token） | `lkqmoe/draft-token-map-49152.pt` |
 | 启动 | 测速所用的完整参数 | `launch/run-glm53-nvfp4.sh` |
+| 双卡启动 | 2× RTX 5070 Ti 16GB + 2× EPYC 7642（AVX2）的 TP2 参数，见“双卡 TP2 部署” | `launch/run-glm53-tp2-5070ti.sh` |
 
 ## 本机硬件
 
@@ -154,10 +156,20 @@ SGLANG_EXPERIMENTAL_DSA_KPOOL_METADATA_FUSION=1  SGLANG_EXPERIMENTAL_DSA_INGRAPH
 
 ## lkqmoe（`lkqmoe/`）
 
-- 编译版：`liblkqmoe.so`（CPU 内核）、`liblkqmoe_cuda.so`（CUDA 信箱桥与 LKQstrata 换入换出管理）、`python/lkqmoe/*.pyc`（lsglang 适配层、Triton GPU 预填充、
+- 编译版：`liblkqmoe.so`（分发库）+ `liblkqmoe_avx512.so` / `liblkqmoe_avx2.so`（CPU 内核）、`liblkqmoe_cuda.so`（CUDA 信箱桥与 LKQstrata 换入换出管理）、`python/lkqmoe/*.pyc`（lsglang 适配层、Triton GPU 预填充、
   LKQstrata 热专家池 `pool.pyc`）、
   `python/lkqmoe/gpu/small_gemm.pyc`（decode 小批量 BF16 GEMM）；含 Triton 内核的模块内嵌压缩源码，因为 Triton 编译时要读源码。
   许可见 `lkqmoe/LICENSE`：可免费使用、原样再分发。
+- 版本 0.5.3（2026-10-17）：**同时支持只有 AVX2 的 CPU 和多卡张量并行（TP）**。
+  - 指令集：`liblkqmoe.so` 启动时检测 CPU，有 AVX512-BF16/VBMI（Zen4、Sapphire Rapids 等）就加载 `liblkqmoe_avx512.so`，
+    只有 AVX2/FMA（Zen2、Zen3 等）就加载 `liblkqmoe_avx2.so`，三个文件放在同一目录；启动日志打印 `[lkqmoe] CPU kernels: avx512`
+    或 `avx2`，`LKQMOE_ISA=avx2` 可强制（例如在 AVX-512 机器上测 AVX2 路径）。AVX-512 路径与 0.5.2 逐位相同、速度持平
+    （三个模型的实权重单层，64 / 112 线程，m = 1…2048）。AVX2 内核按 Zen2 优化（`vpshufb` 查表、每步 32 个权重），FP32 累加，
+    误差与 AVX-512 同量级；同一输入在 Zen2 与 Zen4 上的 AVX2 输出逐位相同。
+  - 张量并行：每个 TP rank 一个进程，各自持有每个专家 1/tp 的中间维，部分和由框架原有的 all-reduce 相加，CPU 侧不需要跨进程通信。
+    `LKQMOE_TP_NODES=auto` 让每个 rank 只用其 GPU 所在 CPU 的 NUMA 节点（权重读本地内存）、并各自挑选信箱调度线程与主线程
+    （也可按 rank 写，如 `0-3|4-7`）；`LKQMOE_THREADS` 按每个 rank 计。LKQstrata 热专家池在每张卡上各存半个专家。
+  - 本管线验证：本机（AVX-512）换 0.5.3 后 PPL 4.062（0.5.2 时三次 4.0587–4.063），500K 首 token 200.9 s、decode 87.3 tok/s，埋藏事实召回；另在只有 AVX2 的 2× EPYC 7642 + 2× RTX 5070 Ti 16GB 上以 TP=2 实测，见下文“双卡 TP2 部署”。
 - 版本 0.5.2（2026-10-16）：CPU 内核按 NUMA 拓扑自动分配——从系统读取每个有 CPU 的 NUMA 节点（本机 NPS2 为 4 个、NPS4 为 8 个），每个节点存每个专家 1/N 的行，线程先用该节点的物理核、再用其 SMT 兄弟线程，不再写死 4 节点 × 16 核。`LKQMOE_MAIN_CPUS=auto` 自动取“允许的 CPU − 专家线程 − 信箱调度线程”，换拓扑或线程数不用手改列表。本机（NPS2）上绑核与 0.5.0 完全相同；三个模型的实权重单层在 64 / 112 线程、默认与生产开关、m = 1…2048 下输出与 0.5.0 逐位相同，速度持平；在本机把每个节点拆成两半模拟 NPS4 的 8 节点布局，输出同样逐位相同。启动日志会打印 `[lkqmoe] N worker nodes ...`。
 - 版本 0.5.0（2026-10-14）：LKQstrata 热专家池。默认关闭，关闭时与 0.4.3 逐位相同（`liblkqmoe.so` 不变）。开关：
   `LKQSTRATA=1`；`LKQSTRATA_SLOTS`（每层槽位，GLM-5.3 用 62 = 上一版 9 个常驻层的显存；保留 3 层常驻时 44）；
@@ -179,8 +191,54 @@ SGLANG_EXPERIMENTAL_DSA_KPOOL_METADATA_FUSION=1  SGLANG_EXPERIMENTAL_DSA_INGRAPH
   - `indexer_chunk.py`：DSA 索引器预填充 logits 分块，512K 不再 OOM。
   - `glm53_cpu_image.py`：图片解码放 CPU（GPU 解码只多占显存再拷回 CPU）。
 - 精度：CPU 专家 BF16 Down（单层对 FP64 相对误差约 1.5e-3）；GPU 预填充对 FP64 误差 2.3e-3。
-- 硬件要求：x86-64 AVX512-BF16（VBMI 更快），NUMA 拓扑自动识别（已验证 NPS2 的 4 节点 × 16 核，NPS4 的 8 节点 × 8 核在本机模拟验证；hidden / intermediate 须是 16 × 节点数的倍数）。启动脚本里的 `LKQMOE_MAIN_CPUS` 列表按本机 NPS2 写好，换到其他拓扑时改成 `auto`，SM120 GPU（`resident_w4a16.py` 的
+- 硬件要求：x86-64，AVX512-BF16/VBMI 或 AVX2/FMA（运行时自动选择），NUMA 拓扑自动识别（已验证 NPS2 的 4 节点 × 16 核，NPS4 的 8 节点 × 8 核在本机模拟验证；hidden / intermediate 须是 16 × 节点数的倍数）。启动脚本里的 `LKQMOE_MAIN_CPUS` 列表按本机 NPS2 写好，换到其他拓扑时改成 `auto`，SM120 GPU（`resident_w4a16.py` 的
   硬件 FP4 转换需要 sm_100a / sm_120a）。
+
+- AVX2 / 多卡使用建议：
+  - 只有 AVX2 的 CPU 上专家计算更慢（同一台 Zen4 上实权重单层的 AVX2 路径约慢 1.4–1.6 倍），decode 更依赖热专家池，显存允许时多给槽位；
+    `LKQMOE_THREADS` 取“每个 NUMA 节点的物理核数 − 1”乘节点数，留出信箱调度线程和主线程。
+  - 多卡：设 `LKQMOE_TP_NODES=auto` 与 `LKQMOE_MAIN_CPUS=auto`，去掉写死的 `LKQMOE_PROBE_DISPATCH_CPU`；
+    每张卡对应的 NUMA 节点最好属于同一颗 CPU（`nvidia-smi topo -m` 可查）。消费级卡之间没有 P2P，加 `--disable-custom-all-reduce`。
+  - TP 下草稿热词表（`--speculative-token-map`）不能用：草稿 lm_head 按完整词表的 id 从目标 lm_head 取行，而 TP 下每个 rank
+    只有自己那一半词表，会越界；去掉后草稿直接共用目标 lm_head，投机解码仍然无损。
+  - lkqmoe 的 GPU 预填充每个分块都要把全部专家权重传到 GPU，PCIe 4.0 主机上 prefill 速度大致与分块大小成正比，显存不够时
+    可减小 `LKQMOE_PREFILL_EXPERT_CHUNK` 和 DSA/索引器类的分块参数来换更大的预填充分块。
+
+## 双卡 TP2 部署（AVX2 主机实测，2026-10-17）
+
+lkqmoe 0.5.3 起可以在只有 AVX2 的 CPU 上运行，并支持多卡张量并行。下面是在一台双卡消费级平台上的实测，启动参数见
+`launch/run-glm53-tp2-5070ti.sh`（路径与尺寸都在脚本开头，可用环境变量覆盖）。
+
+| | |
+|---|---|
+| CPU | 2× AMD EPYC 7642（Zen2，48 核 × 2，**无 AVX-512**），NPS4 → 8 个 NUMA 节点 |
+| 内存 | 256 GB DDR4-3200（16× 16 GB，16 通道） |
+| GPU | 2× NVIDIA RTX 5070 Ti 16GB（SM120），PCIe 4.0 x16，分属两颗 CPU，无 P2P |
+| 系统 | Ubuntu 24.04.5，内核 6.14，驱动 610.57，Python 环境同 `requirements-lock.txt` |
+
+**配置**：`--tp-size 2 --disable-custom-all-reduce`，256K 上下文、单请求；42 个 MoE 层与 NextN 草稿层的路由专家都由 lkqmoe 计算
+（每个 rank 持每个专家的一半，用本 CPU 的 4 个 NUMA 节点、44 个线程，自动选 AVX2 内核）；LKQstrata 每卡每层 4 槽；
+预填充分块 5120；草稿热词表关闭（见上文 TP 说明）。
+
+| 输入 | 首 token | prefill | decode | 结果 |
+|---|---:|---:|---:|---|
+| 短对话（几十 token） | 0.7–1.0 s | — | 35–37 tok/s | 正常 |
+| 64K（65,574） | 60.6 s | 1083 tok/s | 33.4 tok/s | 埋藏事实召回 ✓ |
+| 256K（258,895） | 237.8 s | 1089 tok/s | 34.4 tok/s | 召回 ✓，KV 用到 97%，显存峰值 15770 / 16303 MiB |
+
+（温度 0，输出 1024 token；decode 随草稿接受长度在 3.2–3.8 之间波动。）
+
+- **显存**（每卡）：权重约 8 GiB；256K 的 FP8 KV 约 2.35 GiB（MLA 的 KV 在 TP 下两张卡各存一份全量）；mamba 状态约 0.6 GiB；
+  CUDA graph 与激活约 2 GiB；热专家池每槽约 0.28 GiB（42 层 × 半个专家）。256K 下剩约 0.5 GiB，可以再加 1 个槽位或把分块加到 6144，二选一。
+- **prefill 受 PCIe 4.0 限制**：每个分块都要把全部专家传到 GPU（每卡约 80 GiB，约 23 GB/s），所以速度与分块大小成正比
+  （分块 2048 / 4096 / 5120：约 530 / 940 / 1090 tok/s）。显存紧时把 `LKQMOE_PREFILL_EXPERT_CHUNK` 降到 2、`LKQMOE_INDEXER_Q_CHUNK` 降到 2048，
+  省下的显存换更大的分块。
+- **decode 受 CPU 限制**：每卡热专家池只有 4 槽，命中率约 7%；每层 CPU 专家约 1.4–1.8 ms（AVX2，每 rank 44 核）。
+- **环境注意**：pip 装的 CUDA 运行时没有 `libcudart.so` 和 `lib64`，sglang 的 JIT 内核链接会失败，需在
+  `env/lib/python3.12/site-packages/nvidia/cu13/` 下建 `lib64 -> lib` 与 `lib/libcudart.so -> libcudart.so.13`；没装系统 `ninja` 时把
+  `env/bin` 加进 PATH（脚本已处理）。冷启动约 7 分钟（读权重约 5 分钟）。
+- **其他**：TP 由 lsglang 原有的 `--tp-size` 实现（每个 rank 的 MoE 层以 `num_processes = tp` 创建 lkqmoe 实例，持有本 rank 的专家切片，
+  输出经原有 all-reduce 相加），本仓库补丁没有为 TP 改动框架代码；需要改的只是启动参数和上面的热词表。
 
 ## 测试脚本（`bench/`）
 
