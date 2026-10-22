@@ -1,0 +1,57 @@
+{
+ "date": "2026-10-22",
+ "method": "pool-research/numa/numa_ab.py: one real MoE layer, seeded routes, output digests (sha256 of every case's float32 output) and mean us per call; two interleaved repetitions; 24 channels, NPS4",
+ "configs": [
+  {
+   "library": "lkqmoe 0.5.0 (previous release build)",
+   "threads": 112,
+   "numa_nodes_used": 4,
+   "bitwise_equal_to_0_5_0": true,
+   "us_per_call": {
+    "m1-indep": 627.0,
+    "m2-indep": 1255.9,
+    "m4-indep": 2489.0,
+    "m4-verify": 1336.3,
+    "m8-indep": 4671.3,
+    "m8-verify2": 2277.4,
+    "m64-indep": 20595.3,
+    "m512-indep": 49338.8,
+    "m2048-indep": 216999.2
+   }
+  },
+  {
+   "library": "lkqmoe 0.5.6, LKQMOE_DOWN_R4=1 build (this repository)",
+   "threads": 112,
+   "numa_nodes_used": 8,
+   "bitwise_equal_to_0_5_0": true,
+   "us_per_call": {
+    "m1-indep": 237.2,
+    "m2-indep": 453.4,
+    "m4-indep": 879.6,
+    "m4-verify": 532.5,
+    "m8-indep": 1681.2,
+    "m8-verify2": 991.4,
+    "m64-indep": 8336.1,
+    "m512-indep": 39999.9,
+    "m2048-indep": 204345.8
+   }
+  },
+  {
+   "library": "lkqmoe 0.5.6, LKQMOE_DOWN_R4=4 build",
+   "threads": 112,
+   "numa_nodes_used": 8,
+   "bitwise_equal_to_0_5_0": true,
+   "us_per_call": {
+    "m1-indep": 238.4,
+    "m2-indep": 438.8,
+    "m4-indep": 880.7,
+    "m4-verify": 543.5,
+    "m8-indep": 1641.8,
+    "m8-verify2": 1002.0,
+    "m64-indep": 8692.5,
+    "m512-indep": 39355.2,
+    "m2048-indep": 204300.2
+   }
+  }
+ ]
+}
